@@ -102,6 +102,8 @@ function blankEvent() {
     bentoCheck: false,   // 申込フォームで弁当要否を確認するか
     bentoPrice: 800,
     advanceCount: 8,     // トーナメント進出ペア数
+    allowSameTeam: true, // 同チーム同士の対戦を許可するか
+    allowRematch: true,  // 一度対戦したペア同士の再戦を許可するか
     regOpen: true,
     phase: 'entry',      // entry | training | tournament
     registrations: [],   // {id, teamName, contact, pairs:[{pid,p1,p2,category,year,levelAttr,startLevel}], bentoCount, totalFee, createdAt}
@@ -196,19 +198,24 @@ function ensureAssignments(ev) {
   if (changed) saveDB();
 }
 function pickMatch(ev) {
-  // レベルごとに空きペアを集める
+  // レベルごとに空きペアの組み合わせを探す（同チーム対決・再戦の設定を反映）
+  const pm = pairMap(ev);
+  const played = new Set();
+  for (const m of ev.matches) if (m.status === 'done') played.add([m.a, m.b].sort().join('|'));
   let best = null;
   for (let lv = 0; lv < ev.levels.length; lv++) {
     const free = ev.levels[lv].filter(pid => !activeMatchOf(ev, pid));
     if (free.length < 2) continue;
-    free.sort((x, y) => {
-      const gx = gamesPlayed(ev, x), gy = gamesPlayed(ev, y);
-      if (gx !== gy) return gx - gy;
-      return lastPlayedAt(ev, x) - lastPlayedAt(ev, y);
-    });
-    const a = free[0], b = free[1];
-    const score = gamesPlayed(ev, a) + gamesPlayed(ev, b);
-    if (!best || score < best.score) best = { a, b, level: lv, score };
+    for (let i = 0; i < free.length; i++) {
+      for (let j = i + 1; j < free.length; j++) {
+        const a = free[i], b = free[j];
+        if (ev.allowSameTeam === false && pm[a] && pm[b] && pm[a].teamId === pm[b].teamId) continue;
+        if (ev.allowRematch === false && played.has([a, b].sort().join('|'))) continue;
+        const score = gamesPlayed(ev, a) + gamesPlayed(ev, b);
+        const wait = Math.min(lastPlayedAt(ev, a), lastPlayedAt(ev, b));
+        if (!best || score < best.score || (score === best.score && wait < best.wait)) best = { a, b, level: lv, score, wait };
+      }
+    }
   }
   if (!best) return null;
   ev.matchSeq += 1;
@@ -470,6 +477,8 @@ const server = http.createServer(async (req, res) => {
         if (s.bentoCheck != null) ev.bentoCheck = !!s.bentoCheck;
         if (s.bentoPrice != null) ev.bentoPrice = Math.max(0, parseInt(s.bentoPrice, 10) || 0);
         if (s.advanceCount != null) ev.advanceCount = Math.max(2, parseInt(s.advanceCount, 10) || 8);
+        if (s.allowSameTeam != null) ev.allowSameTeam = !!s.allowSameTeam;
+        if (s.allowRematch != null) ev.allowRematch = !!s.allowRematch;
         if (s.regOpen != null) ev.regOpen = !!s.regOpen;
         // 申込済みペアの金額を再計算
         for (const r of ev.registrations) r.totalFee = calcFee(ev, r.pairs.length, r.bentoCount).total;
@@ -890,7 +899,7 @@ function adminPage() {
     '<div class="card"><h2>大会</h2><div style="display:flex;gap:6px;flex-wrap:wrap"><select id="evsel" style="flex:1;min-width:200px"></select>' +
     '<button class="sub" id="newev">＋ 新しい大会</button><button class="danger" id="delev">この大会を削除</button></div></div>' +
     '<div id="callout"></div>' +
-    '<div class="card"><h2>コート状況と結果入力</h2><div style="margin-bottom:8px"><button id="soundbtn" class="sub">🔊 音声アナウンス：OFF</button> <span class="mut">待機ペアが出たら音声とバナーでお知らせします</span></div><div id="courts" class="grid c2"></div></div>' +
+    '<div class="card"><h2>コート状況と結果入力</h2><div style="margin-bottom:8px"><button id="soundbtn" class="sub">🔊 音声アナウンス：ON</button> <span class="mut">待機ペアが出たら音声とバナーでお知らせします</span></div><div id="courts" class="grid c2"></div></div>' +
     '<div class="card"><h2>大会設定</h2><div id="settings"></div><button id="savesettings">設定を保存</button> <span id="setmsg" class="mut"></span></div>' +
     '<div class="card"><h2>申込一覧・当日資料</h2><div id="regsummary"></div><div id="regs"></div>' +
     '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px"><a class="btn sub" id="printroster" target="_blank">🖨 名簿を印刷</a><a class="btn sub" id="printoutline" target="_blank">🖨 要項を印刷</a></div></div>' +
@@ -898,7 +907,8 @@ function adminPage() {
     '<div class="card"><h2>トーナメント</h2><div id="tournament"></div></div>' +
     '</div></main>';
   const script = CLIENT_COMMON + `
-var EV=null, ST=null, soundOn=false, seenWait={}, firstLoad=true;
+var EV=null, ST=null, seenWait={}, firstLoad=true;
+var soundOn=(function(){try{var v=localStorage.getItem('tt_sound');return v===null?true:v==='1'}catch(e){return true}})();
 function post(path,body){return fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})}).then(function(r){return r.json()})}
 var utters=[];
 function speak(text){
@@ -915,6 +925,13 @@ function speak(text){
   }catch(e){}
 }
 if(window.speechSynthesis){try{speechSynthesis.getVoices();speechSynthesis.onvoiceschanged=function(){speechSynthesis.getVoices()}}catch(e){}}
+/* 音声ロック解除: ページを開いた後の最初のタップで無音の発話をして許可を取り、以後は定期的に resume して停止を防ぐ */
+document.addEventListener('pointerdown',function prime(){
+  try{if(window.speechSynthesis){speechSynthesis.resume();var u=new SpeechSynthesisUtterance(' ');u.volume=0;u.lang='ja-JP';speechSynthesis.speak(u)}}catch(e){}
+  document.removeEventListener('pointerdown',prime);
+});
+setInterval(function(){try{if(soundOn&&window.speechSynthesis)speechSynthesis.resume()}catch(e){}},10000);
+document.addEventListener('visibilitychange',function(){try{if(!document.hidden&&window.speechSynthesis)speechSynthesis.resume()}catch(e){}});
 function loadEvents(){
   return api('/api/events').then(function(j){
     var sel=document.getElementById('evsel');
@@ -1004,6 +1021,8 @@ function renderSettings(){
   fld('参加費（円）','s_feeAmount',s.feeAmount,'number')+'</div>'+
   '<div><label class="f"><span>申込フォームで弁当の要否・個数を確認する</span><select id="s_bentoCheck" style="width:100%"><option value="0"'+(!s.bentoCheck?' selected':'')+'>確認しない</option><option value="1"'+(s.bentoCheck?' selected':'')+'>確認する</option></select></label>'+
   fld('弁当1個の金額（円）','s_bentoPrice',s.bentoPrice,'number')+'</div></div>'+
+  '<div class="grid c2"><div><label class="f"><span>同チーム同士の対戦</span><select id="s_sameTeam" style="width:100%"><option value="1"'+(s.allowSameTeam!==false?' selected':'')+'>あり（対戦する）</option><option value="0"'+(s.allowSameTeam===false?' selected':'')+'>なし（避ける）</option></select></label></div>'+
+  '<div><label class="f"><span>一度対戦したペア同士の再戦</span><select id="s_rematch" style="width:100%"><option value="1"'+(s.allowRematch!==false?' selected':'')+'>あり（再戦する）</option><option value="0"'+(s.allowRematch===false?' selected':'')+'>なし（避ける）</option></select></label></div></div>'+
   '<label class="f"><span>要項の備考</span><textarea id="s_notes" rows="3" style="width:100%">'+esc(s.notes||'')+'</textarea></label>'+
   '<label style="display:block;margin:6px 0"><input type="checkbox" id="s_regOpen" '+(s.regOpen?'checked':'')+'> 申込受付を開放する</label>';
 }
@@ -1086,6 +1105,7 @@ function roundName(total,ri){
 }
 document.getElementById('soundbtn').onclick=function(){
   soundOn=!soundOn;
+  try{localStorage.setItem('tt_sound',soundOn?'1':'0')}catch(e){}
   this.textContent=soundOn?'🔊 音声アナウンス：ON':'🔊 音声アナウンス：OFF';
   if(soundOn)speak('音声アナウンスをオンにしました');
 };
@@ -1095,7 +1115,8 @@ document.getElementById('savesettings').onclick=function(){
     name:g('s_name').value,date:g('s_date').value,venue:g('s_venue').value,organizer:g('s_organizer').value,notes:g('s_notes').value,
     levelCount:parseInt(g('s_levelCount').value,10),courtCount:parseInt(g('s_courtCount').value,10),gameMode:g('s_gameMode').value,
     advanceCount:parseInt(g('s_advanceCount').value,10),feeType:g('s_feeType').value,feeAmount:parseInt(g('s_feeAmount').value,10),
-    bentoCheck:g('s_bentoCheck').value==='1',bentoPrice:parseInt(g('s_bentoPrice').value,10),regOpen:g('s_regOpen').checked
+    bentoCheck:g('s_bentoCheck').value==='1',bentoPrice:parseInt(g('s_bentoPrice').value,10),regOpen:g('s_regOpen').checked,
+    allowSameTeam:g('s_sameTeam').value==='1',allowRematch:g('s_rematch').value==='1'
   }}).then(function(j){document.getElementById('setmsg').textContent=j.ok?'保存しました':'保存に失敗しました';load()});
 };
 document.getElementById('newev').onclick=function(){
@@ -1108,6 +1129,8 @@ document.getElementById('delev').onclick=function(){
   post('/api/admin/event/delete',{eventId:EV.id}).then(function(){EVENT_ID='';loadEvents().then(load)});
 };
 function init(){
+  var sb=document.getElementById('soundbtn');
+  if(sb)sb.textContent=soundOn?'🔊 音声アナウンス：ON':'🔊 音声アナウンス：OFF';
   api('/api/auth/status').then(function(j){
     if(!j.hasPassword){
       document.getElementById('loginTitle').textContent='管理者パスワードを決めてください（初回設定）';
