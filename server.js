@@ -215,10 +215,12 @@ function pickMatch(ev) {
   return { id: 'm' + ev.matchSeq, level: best.level, court: 0, a: best.a, b: best.b, status: 'playing', winner: null, createdAt: Date.now(), calledAt: null, finishedAt: null };
 }
 /* 結果入力: 勝者を1つ上、敗者を1つ下のレベルへ (端は残留)。統計も更新。 */
-function applyResult(ev, match, winnerPid) {
+function applyResult(ev, match, ga, gb) {
+  const winnerPid = ga > gb ? match.a : match.b;
   const loserPid = match.a === winnerPid ? match.b : match.a;
   match.status = 'done';
   match.winner = winnerPid;
+  match.ga = ga; match.gb = gb;
   match.finishedAt = Date.now();
   for (const pid of [winnerPid, loserPid]) if (!ev.stats[pid]) ev.stats[pid] = { w: 0, l: 0 };
   ev.stats[winnerPid].w += 1;
@@ -290,11 +292,13 @@ function propagateByes(ev) {
     }
   }
 }
-function setTournamentWinner(ev, r, i, pid) {
+function setTournamentWinner(ev, r, i, ga, gb) {
   const T = ev.tournament;
   const m = T.rounds[r][i];
-  if (!m || (m.a !== pid && m.b !== pid)) return false;
+  if (!m || !m.a || !m.b) return false;
+  const pid = ga > gb ? m.a : m.b;
   m.winner = pid;
+  m.ga = ga; m.gb = gb;
   if (r + 1 < T.rounds.length) {
     const nm = T.rounds[r + 1][Math.floor(i / 2)];
     nm[i % 2 === 0 ? 'a' : 'b'] = pid;
@@ -323,7 +327,7 @@ function publicState(ev) {
   const recent = ev.matches.filter(m => m.status === 'done').slice(-12).reverse().map(m => ({
     level: m.level, court: m.court,
     a: pairInfo(m.a), b: pairInfo(m.b),
-    winnerPid: m.winner, finishedAt: m.finishedAt,
+    winnerPid: m.winner, finishedAt: m.finishedAt, ga: m.ga, gb: m.gb,
   }));
   return {
     event: { id: ev.id, name: ev.name, date: ev.date, venue: ev.venue, phase: ev.phase, levelCount: ev.levels.length || ev.levelCount, courtCount: ev.courtCount, gameMode: ev.gameMode, regOpen: ev.regOpen },
@@ -333,7 +337,7 @@ function publicState(ev) {
     standings: standings(ev).map(r => ({ rank: r.rank, pid: r.pid, label: pairLabel(r.pair), teamName: r.teamName, w: r.w, l: r.l, games: r.games, rate: r.rate, level: r.level })),
     tournament: ev.tournament ? {
       size: ev.tournament.size,
-      rounds: ev.tournament.rounds.map(rd => rd.map(m => ({ a: m.a ? pairInfo(m.a) : null, b: m.b ? pairInfo(m.b) : null, winner: m.winner }))),
+      rounds: ev.tournament.rounds.map(rd => rd.map(m => ({ a: m.a ? pairInfo(m.a) : null, b: m.b ? pairInfo(m.b) : null, winner: m.winner, ga: m.ga, gb: m.gb }))),
     } : null,
     levelNames: Array.from({ length: Math.max(ev.levels.length, ev.levelCount) }, (_, i) => levelName(i)),
   };
@@ -519,8 +523,10 @@ const server = http.createServer(async (req, res) => {
       if (p === '/api/admin/result') {
         const m = ev.matches.find(m => m.id === b.matchId);
         if (!m || m.status === 'done') return sendJson(res, 404, { error: 'match not found' });
-        if (m.a !== b.winner && m.b !== b.winner) return sendJson(res, 400, { error: 'winner invalid' });
-        applyResult(ev, m, b.winner);
+        const ga = parseInt(b.ga, 10), gb = parseInt(b.gb, 10);
+        if (isNaN(ga) || isNaN(gb) || ga < 0 || gb < 0) return sendJson(res, 400, { error: 'ゲームカウントを入力してください' });
+        if (ga === gb) return sendJson(res, 400, { error: '同点では確定できません' });
+        applyResult(ev, m, ga, gb);
         ensureAssignments(ev);
         saveDB();
         return sendJson(res, 200, { ok: true });
@@ -534,7 +540,10 @@ const server = http.createServer(async (req, res) => {
       }
       if (p === '/api/admin/tournament/result') {
         if (!ev.tournament) return sendJson(res, 400, { error: 'no tournament' });
-        const ok = setTournamentWinner(ev, parseInt(b.round, 10) || 0, parseInt(b.index, 10) || 0, b.winner);
+        const tga = parseInt(b.ga, 10), tgb = parseInt(b.gb, 10);
+        if (isNaN(tga) || isNaN(tgb) || tga < 0 || tgb < 0) return sendJson(res, 400, { error: 'ゲームカウントを入力してください' });
+        if (tga === tgb) return sendJson(res, 400, { error: '同点では確定できません' });
+        const ok = setTournamentWinner(ev, parseInt(b.round, 10) || 0, parseInt(b.index, 10) || 0, tga, tgb);
         if (!ok) return sendJson(res, 400, { error: 'invalid' });
         saveDB();
         return sendJson(res, 200, { ok: true });
@@ -683,7 +692,7 @@ function render(S){
       h+='<div style="min-width:210px"><h3>'+esc(roundName(S.tournament.rounds.length,ri))+'</h3>';
       rd.forEach(function(m,i){
         h+='<div class="match"><span class="badge">'+(i+1)+'</span>'+pairHtml(m.a)+'<div class="mut" style="text-align:center">vs</div>'+pairHtml(m.b);
-        if(m.winner){var w=m.winner===(m.a&&m.a.pid)?m.a:m.b;h+='<div>🏆 <b>'+esc(w?labelOf(S,m.winner):'')+'</b></div>'}
+        if(m.winner){var w=m.winner===(m.a&&m.a.pid)?m.a:m.b;h+='<div>🏆 <b>'+esc(w?labelOf(S,m.winner):'')+'</b>'+(m.ga!=null?'（'+m.ga+'-'+m.gb+'）':'')+'</div>'}
         h+='</div>';
       });
       h+='</div>';
@@ -693,7 +702,7 @@ function render(S){
   // 最近の結果
   document.getElementById('recent').innerHTML=S.recent.length?S.recent.map(function(m){
     var w=m.winnerPid===(m.a&&m.a.pid)?m.a:m.b;
-    return '<div class="match"><span class="badge lv">'+esc(S.levelNames[m.level])+'リーグ</span> '+esc(m.a?m.a.label:'')+' vs '+esc(m.b?m.b.label:'')+' → 勝者：<b>'+esc(w?w.label:'')+'</b> <span class="mut">('+esc(w?w.teamName:'')+')</span></div>';
+    return '<div class="match"><span class="badge lv">'+esc(S.levelNames[m.level])+'リーグ</span> '+esc(m.a?m.a.label:'')+' vs '+esc(m.b?m.b.label:'')+(m.ga!=null?' <b>'+m.ga+'-'+m.gb+'</b>':'')+' → 勝者：<b>'+esc(w?w.label:'')+'</b> <span class="mut">('+esc(w?w.teamName:'')+')</span></div>';
   }).join(''):'<p class="mut">まだ結果がありません</p>';
 }
 function labelOf(S,pid){
@@ -891,14 +900,21 @@ function adminPage() {
   const script = CLIENT_COMMON + `
 var EV=null, ST=null, soundOn=false, seenWait={}, firstLoad=true;
 function post(path,body){return fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})}).then(function(r){return r.json()})}
+var utters=[];
 function speak(text){
   if(!soundOn)return;
   try{
+    if(!window.speechSynthesis)return;
     var u=new SpeechSynthesisUtterance(text);
     u.lang='ja-JP';u.rate=0.95;
-    speechSynthesis.cancel();speechSynthesis.speak(u);
+    var vs=speechSynthesis.getVoices().filter(function(v){return v.lang&&v.lang.indexOf('ja')===0});
+    if(vs.length)u.voice=vs[0];
+    utters.push(u);if(utters.length>10)utters.shift();
+    speechSynthesis.resume();
+    speechSynthesis.speak(u);
   }catch(e){}
 }
+if(window.speechSynthesis){try{speechSynthesis.getVoices();speechSynthesis.onvoiceschanged=function(){speechSynthesis.getVoices()}}catch(e){}}
 function loadEvents(){
   return api('/api/events').then(function(j){
     var sel=document.getElementById('evsel');
@@ -946,8 +962,10 @@ function matchAdminHtml(m,court,status){
   var h='<div class="match '+(status==='playing'?'playing':'waiting')+'"><span class="badge">'+(status==='playing'?'試合中':'待機')+'</span> <span class="badge lv">'+esc(ST.levelNames[m.level])+'リーグ</span>';
   h+=pairHtml(m.a)+'<div class="mut" style="text-align:center">vs</div>'+pairHtml(m.b);
   if(status==='playing'){
-    h+='<div style="display:flex;gap:6px;margin-top:6px"><button onclick="winMatch(\\''+m.id+'\\',\\''+(m.a?m.a.pid:'')+'\\')">🏆 '+esc(m.a?m.a.label:'')+' の勝ち</button>'+
-    '<button onclick="winMatch(\\''+m.id+'\\',\\''+(m.b?m.b.pid:'')+'\\')">🏆 '+esc(m.b?m.b.label:'')+' の勝ち</button></div>';
+    h+='<div style="display:flex;gap:6px;margin-top:6px;align-items:center;flex-wrap:wrap"><span class="mut">ゲーム数</span>'+
+    '<input type="number" min="0" id="sc-'+m.id+'-a" style="width:64px" placeholder="'+esc(m.a?m.a.label:'')+'">'+
+    '<span>―</span><input type="number" min="0" id="sc-'+m.id+'-b" style="width:64px" placeholder="'+esc(m.b?m.b.label:'')+'">'+
+    '<button onclick="confirmScore(\\''+m.id+'\\')">確定</button></div>';
   }
   return h+'</div>';
 }
@@ -961,8 +979,12 @@ function renderCourts(){
     return h+'</div>';
   }).join('');
 }
-window.winMatch=function(mid,pid){
-  post('/api/admin/result',{eventId:EV.id,matchId:mid,winner:pid}).then(function(j){if(!j.ok)alert(j.error||'失敗');load()});
+window.confirmScore=function(mid){
+  var ea=document.getElementById('sc-'+mid+'-a'),eb=document.getElementById('sc-'+mid+'-b');
+  var ga=parseInt(ea?ea.value:'',10),gb=parseInt(eb?eb.value:'',10);
+  if(isNaN(ga)||isNaN(gb)){alert('ゲームカウントを両方入力してください');return}
+  if(ga===gb){alert('同点では確定できません');return}
+  post('/api/admin/result',{eventId:EV.id,matchId:mid,ga:ga,gb:gb}).then(function(j){if(!j.ok)alert(j.error||'失敗');load()});
 };
 function fld(label,id,val,type,extra){
   return '<label class="f"><span>'+label+'</span><input id="'+id+'" type="'+(type||'text')+'" value="'+esc(val==null?'':val)+'" '+(extra||'')+' style="width:100%"></label>';
@@ -1039,16 +1061,22 @@ function renderTournament(){
     rd.forEach(function(m,i){
       h+='<div class="match"><span class="badge">'+(i+1)+'</span>'+pairHtml(m.a)+'<div class="mut" style="text-align:center">vs</div>'+pairHtml(m.b);
       if(m.a&&m.b&&!m.winner){
-        h+='<div style="display:flex;gap:6px;margin-top:6px"><button onclick="winT('+ri+','+i+',\\''+m.a.pid+'\\')">🏆 '+esc(m.a.label)+'</button><button onclick="winT('+ri+','+i+',\\''+m.b.pid+'\\')">🏆 '+esc(m.b.label)+'</button></div>';
+        h+='<div style="display:flex;gap:6px;margin-top:6px;align-items:center;flex-wrap:wrap"><span class="mut">ゲーム数</span><input type="number" min="0" id="ts-'+ri+'-'+i+'-a" style="width:60px"><span>―</span><input type="number" min="0" id="ts-'+ri+'-'+i+'-b" style="width:60px"><button onclick="confirmT('+ri+','+i+')">確定</button></div>';
       }
-      if(m.winner){var w=m.winner===(m.a&&m.a.pid)?m.a:m.b;h+='<div>🏆 <b>'+esc(w?w.label:'')+'</b></div>'}
+      if(m.winner){var w=m.winner===(m.a&&m.a.pid)?m.a:m.b;h+='<div>🏆 <b>'+esc(w?w.label:'')+'</b>'+(m.ga!=null?'（'+m.ga+'-'+m.gb+'）':'')+'</div>'}
       h+='</div>';
     });
     h+='</div>';
   });
   t.innerHTML=h+'</div>';
 }
-window.winT=function(r,i,pid){post('/api/admin/tournament/result',{eventId:EV.id,round:r,index:i,winner:pid}).then(function(j){if(!j.ok)alert(j.error||'失敗');load()})};
+window.confirmT=function(r,i){
+  var ea=document.getElementById('ts-'+r+'-'+i+'-a'),eb=document.getElementById('ts-'+r+'-'+i+'-b');
+  var ga=parseInt(ea?ea.value:'',10),gb=parseInt(eb?eb.value:'',10);
+  if(isNaN(ga)||isNaN(gb)){alert('ゲームカウントを両方入力してください');return}
+  if(ga===gb){alert('同点では確定できません');return}
+  post('/api/admin/tournament/result',{eventId:EV.id,round:r,index:i,ga:ga,gb:gb}).then(function(j){if(!j.ok)alert(j.error||'失敗');load()});
+};
 function roundName(total,ri){
   var fromEnd=total-1-ri;
   if(fromEnd===0)return '決勝';
