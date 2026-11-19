@@ -306,6 +306,43 @@ function movePair(ev, pid, dir) {
   ev.levels[lv] = ev.levels[lv].filter(x => x !== pid);
   ev.levels[nl].push(pid);
 }
+function movePairToLevel(ev, pid, target) {
+  if (target < 0 || target >= ev.levels.length) return;
+  const lv = pairLevel(ev, pid);
+  if (lv < 0 || lv === target) return;
+  ev.levels[lv] = ev.levels[lv].filter(x => x !== pid);
+  if (!Array.isArray(ev.levels[target])) ev.levels[target] = [];
+  ev.levels[target].push(pid);
+}
+/* 終わった試合の結果修正: 統計は巻き戻して付け直す。
+   レベルの移動は、その試合より後に終わった試合が両ペアとも無い場合のみ正確に戻せる。
+   後の試合がある場合は勝敗・勝率のみ修正し、レベル位置は変更しない。 */
+function fixResult(ev, m, ga, gb) {
+  const oldWinner = m.winner;
+  const oldLoser = oldWinner === m.a ? m.b : m.a;
+  const newWinner = ga > gb ? m.a : m.b;
+  const newLoser = newWinner === m.a ? m.b : m.a;
+  for (const pid of [oldWinner, oldLoser, newWinner, newLoser]) if (!ev.stats[pid]) ev.stats[pid] = { w: 0, l: 0 };
+  ev.stats[oldWinner].w = Math.max(0, ev.stats[oldWinner].w - 1);
+  ev.stats[oldLoser].l = Math.max(0, ev.stats[oldLoser].l - 1);
+  ev.stats[newWinner].w += 1;
+  ev.stats[newLoser].l += 1;
+  let levelsAdjusted = true;
+  if (oldWinner !== newWinner) {
+    const later = ev.matches.some(x => x.status === 'done' && x.id !== m.id && (x.finishedAt || 0) > (m.finishedAt || 0) && (x.a === m.a || x.b === m.a || x.a === m.b || x.b === m.b));
+    if (!later) {
+      movePairToLevel(ev, oldWinner, m.level);
+      movePairToLevel(ev, oldLoser, m.level);
+      movePair(ev, newWinner, -1);
+      movePair(ev, newLoser, +1);
+    } else {
+      levelsAdjusted = false;
+    }
+  }
+  m.ga = ga; m.gb = gb; m.winner = newWinner;
+  m.fixedAt = Date.now();
+  return { levelsAdjusted };
+}
 /* 実績ランキング: 勝率→勝数→敗数 の順 */
 function standings(ev) {
   const pm = pairMap(ev);
@@ -396,7 +433,7 @@ function publicState(ev) {
     });
   }
   const recent = ev.matches.filter(m => m.status === 'done').slice(-12).reverse().map(m => ({
-    level: m.level, court: m.court,
+    id: m.id, level: m.level, court: m.court,
     a: pairInfo(m.a), b: pairInfo(m.b),
     winnerPid: m.winner, finishedAt: m.finishedAt, ga: m.ga, gb: m.gb,
   }));
@@ -730,6 +767,17 @@ const server = http.createServer(async (req, res) => {
         ensureAssignments(ev);
         saveDB();
         return sendJson(res, 200, { ok: true });
+      }
+      if (p === '/api/admin/result/fix') {
+        const m = ev.matches.find(m => m.id === b.matchId);
+        if (!m || m.status !== 'done') return sendJson(res, 404, { error: 'match not found' });
+        const ga = parseInt(b.ga, 10), gb = parseInt(b.gb, 10);
+        if (isNaN(ga) || isNaN(gb) || ga < 0 || gb < 0) return sendJson(res, 400, { error: 'ゲームカウントを入力してください' });
+        if (ga === gb) return sendJson(res, 400, { error: '同点では確定できません' });
+        const r = fixResult(ev, m, ga, gb);
+        ensureAssignments(ev);
+        saveDB();
+        return sendJson(res, 200, { ok: true, levelsAdjusted: r.levelsAdjusted });
       }
       if (p === '/api/admin/tournament/start') {
         if (ev.phase !== 'training') return sendJson(res, 400, { error: 'トレーニング中のみ移行できます' });
@@ -1124,6 +1172,7 @@ function adminPage() {
     '<button class="sub" id="newev">＋ 新しい大会</button><button class="danger" id="delev">この大会を削除</button></div></div>' +
     '<div id="callout"></div>' +
     '<div class="card"><h2>コート状況と結果入力</h2><div style="margin-bottom:8px"><button id="soundbtn" class="sub">🔊 音声アナウンス：ON</button> <button id="soundtest" class="sub">▶ テスト再生</button> <span class="mut">待機ペアが出たらチャイム＋音声とバナーでお知らせします</span><div id="soundstat" class="mut" style="margin-top:4px"></div></div><div id="courts" class="grid c2"></div></div>' +
+    '<div class="card"><h2>✏️ 終わった試合の結果修正</h2><p class="mut">直近12試合のスコアを直せます。勝敗が変わると勝敗数・勝率も直ります。その試合より後の試合が無いペア同士なら、レベルの移動も合わせて戻します。</p><div id="fixlist"></div></div>' +
     '<div class="card"><h2>大会設定</h2><div id="settings"></div><button id="savesettings">設定を保存</button> <span id="setmsg" class="mut"></span></div>' +
     '<div class="card"><h2>申込一覧・当日資料</h2><div id="regsummary"></div><div id="regs"></div>' +
     '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px"><a class="btn sub" id="printroster" target="_blank">🖨 名簿を印刷</a><a class="btn sub" id="printoutline" target="_blank">🖨 要項を印刷</a></div></div>' +
@@ -1273,7 +1322,7 @@ function render(){
   if(!EV||!ST)return;
   document.getElementById('printroster').href='/print/roster?event='+EV.id;
   document.getElementById('printoutline').href='/print/outline?event='+EV.id;
-  renderCourts();renderSettings();renderRegs();renderPhase();renderTournament();
+  renderCourts();renderSettings();renderRegs();renderPhase();renderTournament();renderFixList();
 }
 function announceCheck(){
   var calls=[];
@@ -1316,6 +1365,32 @@ function renderCourts(){
     return h+'</div>';
   }).join('');
 }
+function renderFixList(){
+  var ae=document.activeElement;
+  if(ae&&ae.id&&ae.id.indexOf('fx-')===0)return;
+  var el=document.getElementById('fixlist');
+  if(!el)return;
+  if(!ST.recent||!ST.recent.length){el.innerHTML='<p class="mut">終了した試合はまだありません</p>';return}
+  el.innerHTML=ST.recent.map(function(m){
+    var winA=m.winnerPid===(m.a&&m.a.pid);
+    return '<div class="match"><span class="badge lv">'+esc(ST.levelNames[m.level])+'リーグ</span> <span class="mut">'+m.court+'番コート</span>'+
+    '<div style="margin-top:4px">'+(winA?'🏆 ':'')+pairHtml(m.a)+'</div>'+
+    '<div style="display:flex;gap:6px;align-items:center;margin:4px 0"><input type="number" min="0" id="fx-'+m.id+'-a" style="width:64px" value="'+(m.ga==null?'':m.ga)+'"><span>―</span><input type="number" min="0" id="fx-'+m.id+'-b" style="width:64px" value="'+(m.gb==null?'':m.gb)+'"><button class="sub" onclick="fixScore(\\''+m.id+'\\')">修正する</button></div>'+
+    '<div>'+(winA?'':'🏆 ')+pairHtml(m.b)+'</div></div>';
+  }).join('');
+}
+window.fixScore=function(mid){
+  var ea=document.getElementById('fx-'+mid+'-a'),eb=document.getElementById('fx-'+mid+'-b');
+  var ga=parseInt(ea?ea.value:'',10),gb=parseInt(eb?eb.value:'',10);
+  if(isNaN(ga)||isNaN(gb)){alert('ゲームカウントを両方入力してください');return}
+  if(ga===gb){alert('同点では確定できません');return}
+  if(!confirm('この試合の結果を '+ga+'-'+gb+' に修正しますか？'))return;
+  post('/api/admin/result/fix',{eventId:EV.id,matchId:mid,ga:ga,gb:gb}).then(function(j){
+    if(!j.ok){alert(j.error||'失敗');return}
+    if(j.levelsAdjusted===false)alert('勝敗と勝率は修正しました。ただし、この後に終わった試合があるため、レベルの位置は変更していません。');
+    load();
+  });
+};
 window.confirmScore=function(mid){
   var ea=document.getElementById('sc-'+mid+'-a'),eb=document.getElementById('sc-'+mid+'-b');
   var ga=parseInt(ea?ea.value:'',10),gb=parseInt(eb?eb.value:'',10);
