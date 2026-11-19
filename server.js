@@ -158,7 +158,7 @@ function pairYearLabel(p) {
 }
 function autoLevel(ev, levelAttr) {
   const score = levelAttr === '県大会出場' ? 0 : levelAttr === '地区大会出場' ? 1 : levelAttr === '地区大会未出場' ? 2 : 3;
-  const n = Math.max(1, ev.levelCount || (ev.levels && ev.levels.length) || 4);
+  const n = Math.max(1, (ev.levels && ev.levels.length) || ev.levelCount || 4);
   return Math.min(n - 1, Math.floor(score * n / 4));
 }
 function regDeadlineOf(ev) { return ev.regDeadline || ev.date || ''; }
@@ -173,8 +173,10 @@ function placePairInTraining(ev, pair) {
   if (!Array.isArray(ev.levels) || ev.levels.length === 0) {
     ev.levels = Array.from({ length: Math.max(1, ev.levelCount || 4) }, () => []);
   }
+  for (let i = 0; i < ev.levels.length; i++) if (!Array.isArray(ev.levels[i])) ev.levels[i] = [];
   let lv = pair.startLevel;
   if (lv == null || lv < 0 || lv >= ev.levels.length) lv = autoLevel(ev, pair.levelAttr);
+  if (lv == null || lv < 0 || lv >= ev.levels.length) lv = ev.levels.length - 1;
   if (!ev.levels[lv].includes(pair.pid)) ev.levels[lv].push(pair.pid);
   if (!ev.stats[pair.pid]) ev.stats[pair.pid] = { w: 0, l: 0 };
 }
@@ -191,7 +193,7 @@ function calcFee(ev, pairCount, bentoCount) {
 
 /* ---------------- training logic ---------------- */
 function pairLevel(ev, pid) {
-  for (let i = 0; i < ev.levels.length; i++) if (ev.levels[i].includes(pid)) return i;
+  for (let i = 0; i < ev.levels.length; i++) if (Array.isArray(ev.levels[i]) && ev.levels[i].includes(pid)) return i;
   return -1;
 }
 function activeMatchOf(ev, pid) {
@@ -264,7 +266,7 @@ function pickMatch(ev) {
   }
   let best = null;
   for (let lv = 0; lv < ev.levels.length; lv++) {
-    const free = ev.levels[lv].filter(pid => !activeMatchOf(ev, pid));
+    const free = (Array.isArray(ev.levels[lv]) ? ev.levels[lv] : []).filter(pid => !activeMatchOf(ev, pid));
     if (free.length < 2) continue;
     const la = activeByLevel[lv] || 0;
     for (let i = 0; i < free.length; i++) {
@@ -576,7 +578,13 @@ const server = http.createServer(async (req, res) => {
         if (s.venue != null) ev.venue = String(s.venue);
         if (s.organizer != null) ev.organizer = String(s.organizer);
         if (s.notes != null) ev.notes = String(s.notes);
-        if (s.levelCount != null) ev.levelCount = Math.max(1, Math.min(12, parseInt(s.levelCount, 10) || 4));
+        if (s.levelCount != null) {
+          ev.levelCount = Math.max(1, Math.min(12, parseInt(s.levelCount, 10) || 4));
+          if (ev.phase === 'training' && Array.isArray(ev.levels) && ev.levels.length) {
+            while (ev.levels.length < ev.levelCount) ev.levels.push([]);
+            while (ev.levels.length > ev.levelCount && ev.levels[ev.levels.length - 1].length === 0) ev.levels.pop();
+          }
+        }
         if (s.courtCount != null) ev.courtCount = Math.max(1, Math.min(30, parseInt(s.courtCount, 10) || 4));
         if (['single', 'double', 'triple'].includes(s.gameMode)) ev.gameMode = s.gameMode;
         if (['person', 'pair', 'team'].includes(s.feeType)) ev.feeType = s.feeType;
