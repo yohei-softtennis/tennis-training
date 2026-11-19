@@ -14,6 +14,7 @@ const DATA_FILE = path.join(DATA_DIR, 'data.json');
 
 /* ---------------- storage ---------------- */
 let DB = null;
+const ttsCache = new Map();
 function loadDB() {
   try {
     DB = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
@@ -215,16 +216,24 @@ function ensureAssignments(ev) {
   if (ev.phase !== 'training') return;
   const per = matchesPerCourt(ev);
   let changed = false;
+  const playingCount = c => ev.matches.filter(m => m.court === c && m.status === 'playing').length;
+  // まず空いているコートへ、他のコートで待機しているマッチを移動して開始する。
+  // 待機マッチをコートに固定したままだと、空きコートがあっても特定レベルが滞留するため。
   for (let court = 1; court <= ev.courtCount; court++) {
-    // 待機があれば試合中へ繰り上げ
-    for (;;) {
-      const playing = ev.matches.filter(m => m.court === court && m.status === 'playing').length;
-      if (playing >= per) break;
-      const w = ev.matches.find(m => m.court === court && m.status === 'waiting');
+    while (playingCount(court) < per) {
+      let w = ev.matches.find(m => m.court === court && m.status === 'waiting');
+      if (!w) {
+        const others = ev.matches.filter(m => m.status === 'waiting' && m.court !== court)
+          .sort((x, y) => (x.calledAt || x.createdAt || 0) - (y.calledAt || y.createdAt || 0));
+        w = others[0];
+        if (w) w.court = court;
+      }
       if (!w) break;
       w.status = 'playing';
       changed = true;
     }
+  }
+  for (let court = 1; court <= ev.courtCount; court++) {
     // 空き枠 (試合中+待機) があれば新規マッチを作成
     for (;;) {
       const playing = ev.matches.filter(m => m.court === court && m.status === 'playing').length;
@@ -243,14 +252,21 @@ function ensureAssignments(ev) {
   if (changed) saveDB();
 }
 function pickMatch(ev) {
-  // レベルごとに空きペアの組み合わせを探す（同チーム対決・再戦の設定を反映）
+  // レベルごとに空きペアの組み合わせを探す（同チーム対決・再戦の設定を反映）。
+  // 優先順: そのレベルで進行中（試合中＋待機）のマッチが少ない → 試合数の少ないペア → 長く待っているペア。
+  // 進行中マッチ数を先に見ることで、特定レベルだけが滞るのを防ぐ。
   const pm = pairMap(ev);
   const played = new Set();
-  for (const m of ev.matches) if (m.status === 'done') played.add([m.a, m.b].sort().join('|'));
+  const activeByLevel = {};
+  for (const m of ev.matches) {
+    if (m.status === 'done') played.add([m.a, m.b].sort().join('|'));
+    else activeByLevel[m.level] = (activeByLevel[m.level] || 0) + 1;
+  }
   let best = null;
   for (let lv = 0; lv < ev.levels.length; lv++) {
     const free = ev.levels[lv].filter(pid => !activeMatchOf(ev, pid));
     if (free.length < 2) continue;
+    const la = activeByLevel[lv] || 0;
     for (let i = 0; i < free.length; i++) {
       for (let j = i + 1; j < free.length; j++) {
         const a = free[i], b = free[j];
@@ -258,7 +274,7 @@ function pickMatch(ev) {
         if (ev.allowRematch === false && played.has([a, b].sort().join('|'))) continue;
         const score = gamesPlayed(ev, a) + gamesPlayed(ev, b);
         const wait = Math.min(lastPlayedAt(ev, a), lastPlayedAt(ev, b));
-        if (!best || score < best.score || (score === best.score && wait < best.wait)) best = { a, b, level: lv, score, wait };
+        if (!best || la < best.la || (la === best.la && (score < best.score || (score === best.score && wait < best.wait)))) best = { a, b, level: lv, la, score, wait };
       }
     }
   }
@@ -439,6 +455,27 @@ const server = http.createServer(async (req, res) => {
       const t = newToken(); DB.viewSessions.push({ t, evId: ev.id }); saveDB();
       res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Set-Cookie': 'tt_view=' + t + '; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000' });
       return res.end(JSON.stringify({ ok: true }));
+    }
+    if (p === '/api/tts') {
+      const q = String(url.searchParams.get('q') || '').slice(0, 140);
+      if (!q) return sendJson(res, 400, { error: 'no text' });
+      const key = crypto.createHash('sha1').update(q).digest('hex');
+      if (ttsCache.has(key)) {
+        res.writeHead(200, { 'Content-Type': 'audio/mpeg', 'Cache-Control': 'public, max-age=86400' });
+        return res.end(ttsCache.get(key));
+      }
+      try {
+        const u = 'https://translate.google.com/translate_tts?ie=UTF-8&client=tw-ob&tl=ja&q=' + encodeURIComponent(q);
+        const r = await fetch(u, { headers: { 'User-Agent': 'Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36', 'Referer': 'https://translate.google.com/' } });
+        if (!r.ok) throw new Error('tts status ' + r.status);
+        const buf = Buffer.from(await r.arrayBuffer());
+        if (ttsCache.size > 200) ttsCache.clear();
+        ttsCache.set(key, buf);
+        res.writeHead(200, { 'Content-Type': 'audio/mpeg', 'Cache-Control': 'public, max-age=86400' });
+        return res.end(buf);
+      } catch (e) {
+        return sendJson(res, 502, { error: 'tts unavailable' });
+      }
     }
     if (p === '/logo.png') {
       try {
@@ -1107,24 +1144,61 @@ function speakNative(text,done){
     setTimeout(function(){done&&done()},Math.max(4000,text.length*350));
   }catch(e){done&&done()}
 }
+function ensureCtx(){
+  try{
+    if(!audioCtx){var AC=window.AudioContext||window.webkitAudioContext;if(AC)audioCtx=new AC()}
+    if(audioCtx&&audioCtx.state==='suspended')audioCtx.resume();
+  }catch(e){}
+  return audioCtx;
+}
+function playTTSWebAudio(text){
+  return new Promise(function(resolve){
+    var ctx=ensureCtx();
+    if(!ctx){resolve(false);return}
+    var settled=false;var ok=function(v){if(settled)return;settled=true;resolve(v)};
+    fetch('/api/tts?q='+encodeURIComponent(text)).then(function(r){
+      if(!r.ok)throw new Error('tts '+r.status);
+      return r.arrayBuffer();
+    }).then(function(ab){
+      return ctx.decodeAudioData(ab);
+    }).then(function(buf){
+      var src=ctx.createBufferSource();
+      src.buffer=buf;src.connect(ctx.destination);
+      src.onended=function(){ok(true)};
+      src.start();
+      soundStat('音声：読み上げ中（チャイムと同じ仕組みで再生）');
+      setTimeout(function(){ok(true)},buf.duration*1000+5000);
+    }).catch(function(){ok(false)});
+    setTimeout(function(){ok(false)},8000);
+  });
+}
+function playTTSAudioEl(text){
+  return new Promise(function(resolve){
+    var settled=false;var ok=function(v){if(settled)return;settled=true;resolve(v)};
+    try{
+      var a=new Audio('/api/tts?q='+encodeURIComponent(text));
+      curAudio=a;
+      a.onended=function(){ok(true)};
+      a.onerror=function(){ok(false)};
+      var pr=a.play();
+      if(pr&&pr.catch)pr.catch(function(){ok(false)});
+      setTimeout(function(){ok(!a.paused)},30000);
+    }catch(e){ok(false)}
+  });
+}
 function playNextSpeak(){
   if(!speakQueue.length){speakPlaying=false;return}
   speakPlaying=true;
   var text=speakQueue.shift();
-  var finished=false;
-  var finish=function(){if(finished)return;finished=true;setTimeout(playNextSpeak,350)};
-  try{
-    var url='https://translate.google.com/translate_tts?ie=UTF-8&client=tw-ob&tl=ja&q='+encodeURIComponent(text);
-    var a=new Audio(url);
-    curAudio=a;
-    a.onended=finish;
-    a.onerror=function(){soundStat('音声：端末の音声で再生します');speakNative(text,finish)};
-    var pr=a.play();
-    if(pr&&pr.catch)pr.catch(function(){soundStat('音声：端末の音声で再生します');speakNative(text,finish)});
-    else soundStat('音声：読み上げ中…');
-    setTimeout(function(){if(!finished&&a.paused===false)soundStat('音声：ネット音声で再生中')},600);
-    setTimeout(finish,30000);
-  }catch(e){speakNative(text,finish)}
+  playTTSWebAudio(text).then(function(done1){
+    if(done1){setTimeout(playNextSpeak,300);return}
+    soundStat('音声：別の方式で再生します');
+    return playTTSAudioEl(text).then(function(done2){
+      if(done2){setTimeout(playNextSpeak,300);return}
+      soundStat('音声：端末の音声で再生します');
+      speakNative(text,function(){setTimeout(playNextSpeak,300)});
+    });
+  });
 }
 function speak(text){
   if(!soundOn)return;
@@ -1134,9 +1208,8 @@ function speak(text){
 function chime(){
   if(!soundOn)return;
   try{
-    if(!audioCtx){var AC=window.AudioContext||window.webkitAudioContext;if(AC)audioCtx=new AC()}
+    ensureCtx();
     if(!audioCtx)return;
-    if(audioCtx.state==='suspended')audioCtx.resume();
     var t0=audioCtx.currentTime;
     [880,1318].forEach(function(f,i){
       var o=audioCtx.createOscillator(),g=audioCtx.createGain();
@@ -1161,8 +1234,7 @@ if(window.speechSynthesis){try{speechSynthesis.getVoices();speechSynthesis.onvoi
 document.addEventListener('pointerdown',function prime(){
   armed=true;
   try{
-    var AC=window.AudioContext||window.webkitAudioContext;
-    if(AC){if(!audioCtx)audioCtx=new AC();if(audioCtx.state==='suspended')audioCtx.resume()}
+    ensureCtx();
     var silent=new Audio('data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YQAAAAA=');
     var pr=silent.play();if(pr&&pr.catch)pr.catch(function(){});
     if(window.speechSynthesis)speechSynthesis.resume();
