@@ -22,6 +22,7 @@ function loadDB() {
     DB = { adminHash: null, events: [] };
   }
   if (!DB.sessions) DB.sessions = [];
+  if (!DB.viewSessions) DB.viewSessions = [];
 }
 function saveDB() {
   fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -52,6 +53,17 @@ function sessionToken(req) {
 function isAdmin(req) {
   const t = sessionToken(req);
   return !!t && DB.sessions.includes(t);
+}
+function cookieVal(req, name) {
+  const c = (req.headers.cookie || '').split(';').map(s => s.trim());
+  for (const p of c) if (p.startsWith(name + '=')) return p.slice(name.length + 1);
+  return null;
+}
+function hasViewAccess(req, ev) {
+  if (!ev.viewPassHash) return true;
+  if (isAdmin(req)) return true;
+  const t = cookieVal(req, 'tt_view');
+  return !!t && DB.viewSessions.some(s => s.t === t && s.evId === ev.id);
 }
 
 /* ---------------- utils ---------------- */
@@ -105,8 +117,10 @@ function blankEvent() {
     allowSameTeam: true, // 同チーム同士の対戦を許可するか
     allowRematch: true,  // 一度対戦したペア同士の再戦を許可するか
     regOpen: true,
+    regDeadline: '',     // 受付締切日 (YYYY-MM-DD)。空欄なら開催日まで受付
+    viewPassHash: null,  // 閲覧用パスワード (大会ごと)。nullなら誰でも閲覧可
     phase: 'entry',      // entry | training | tournament
-    registrations: [],   // {id, teamName, contact, pairs:[{pid,p1,p2,category,year,levelAttr,startLevel}], bentoCount, totalFee, createdAt}
+    registrations: [],   // {id, teamName, contact, pairs:[{pid,p1,p2,category,year1,year2,levelAttr,startLevel}], bentoCount, totalFee, createdAt}
     levels: [],          // training: [[pid,...], ...]
     stats: {},           // pid -> {w, l}
     matches: [],         // {id, level, court, a, b, status: waiting|playing|done, winner, createdAt, calledAt, finishedAt}
@@ -132,6 +146,37 @@ function pairMap(ev) {
   return m;
 }
 function pairLabel(p) { return p ? (p.p1 + '・' + p.p2) : '未定'; }
+function pairYears(p) {
+  const y1 = p.year1 || p.year || '一般';
+  const y2 = p.year2 || p.year || '一般';
+  return [y1, y2];
+}
+function pairYearLabel(p) {
+  const ys = pairYears(p);
+  return ys[0] === ys[1] ? ys[0] : ys[0] + '・' + ys[1];
+}
+function autoLevel(ev, levelAttr) {
+  const score = levelAttr === '県大会出場' ? 0 : levelAttr === '地区大会出場' ? 1 : levelAttr === '地区大会未出場' ? 2 : 3;
+  const n = Math.max(1, ev.levelCount || (ev.levels && ev.levels.length) || 4);
+  return Math.min(n - 1, Math.floor(score * n / 4));
+}
+function regDeadlineOf(ev) { return ev.regDeadline || ev.date || ''; }
+function isRegOpen(ev) {
+  if (!ev.regOpen) return false;
+  if (ev.phase === 'tournament') return false;
+  const dl = regDeadlineOf(ev);
+  if (dl && todayStr() > dl) return false;
+  return true;
+}
+function placePairInTraining(ev, pair) {
+  if (!Array.isArray(ev.levels) || ev.levels.length === 0) {
+    ev.levels = Array.from({ length: Math.max(1, ev.levelCount || 4) }, () => []);
+  }
+  let lv = pair.startLevel;
+  if (lv == null || lv < 0 || lv >= ev.levels.length) lv = autoLevel(ev, pair.levelAttr);
+  if (!ev.levels[lv].includes(pair.pid)) ev.levels[lv].push(pair.pid);
+  if (!ev.stats[pair.pid]) ev.stats[pair.pid] = { w: 0, l: 0 };
+}
 
 /* 参加費計算: feeType person=人数単位 pair=ペア単位 team=チーム単位 / 弁当は個数×単価 */
 function calcFee(ev, pairCount, bentoCount) {
@@ -320,7 +365,8 @@ function publicState(ev) {
     const p = pm[pid];
     if (!p) return null;
     const s = ev.stats[pid] || { w: 0, l: 0 };
-    return { pid, label: pairLabel(p), teamName: p.teamName, category: p.category, year: p.year, levelAttr: p.levelAttr, w: s.w, l: s.l };
+    const ys = pairYears(p);
+    return { pid, label: pairLabel(p), teamName: p.teamName, category: p.category, year: pairYearLabel(p), year1: ys[0], year2: ys[1], levelAttr: p.levelAttr, w: s.w, l: s.l };
   };
   ensureAssignments(ev);
   const courts = [];
@@ -337,11 +383,11 @@ function publicState(ev) {
     winnerPid: m.winner, finishedAt: m.finishedAt, ga: m.ga, gb: m.gb,
   }));
   return {
-    event: { id: ev.id, name: ev.name, date: ev.date, venue: ev.venue, phase: ev.phase, levelCount: ev.levels.length || ev.levelCount, courtCount: ev.courtCount, gameMode: ev.gameMode, regOpen: ev.regOpen },
+    event: { id: ev.id, name: ev.name, date: ev.date, venue: ev.venue, phase: ev.phase, levelCount: ev.levels.length || ev.levelCount, courtCount: ev.courtCount, gameMode: ev.gameMode, regOpen: isRegOpen(ev), regDeadline: regDeadlineOf(ev), hasViewPass: !!ev.viewPassHash },
     levels: ev.levels.map((l, i) => ({ level: i, name: levelName(i), pairs: l.map(pid => pairInfo(pid)) })),
     courts,
     recent,
-    standings: standings(ev).map(r => ({ rank: r.rank, pid: r.pid, label: pairLabel(r.pair), teamName: r.teamName, w: r.w, l: r.l, games: r.games, rate: r.rate, level: r.level })),
+    standings: standings(ev).map(r => ({ rank: r.rank, pid: r.pid, label: pairLabel(r.pair), teamName: r.teamName, category: r.pair.category, year: pairYearLabel(r.pair), levelAttr: r.pair.levelAttr, w: r.w, l: r.l, games: r.games, rate: r.rate, level: r.level })),
     tournament: ev.tournament ? {
       size: ev.tournament.size,
       rounds: ev.tournament.rounds.map(rd => rd.map(m => ({ a: m.a ? pairInfo(m.a) : null, b: m.b ? pairInfo(m.b) : null, winner: m.winner, ga: m.ga, gb: m.gb }))),
@@ -376,18 +422,36 @@ const server = http.createServer(async (req, res) => {
   try {
     /* ----- public API ----- */
     if (p === '/api/events') {
-      return sendJson(res, 200, { events: DB.events.map(e => ({ id: e.id, name: e.name, date: e.date, phase: e.phase, regOpen: e.regOpen })) });
+      return sendJson(res, 200, { events: DB.events.map(e => ({ id: e.id, name: e.name, date: e.date, phase: e.phase, regOpen: isRegOpen(e), regDeadline: regDeadlineOf(e), hasViewPass: !!e.viewPassHash })) });
     }
     if (p === '/api/state') {
       const ev = getEvent(url.searchParams.get('event'));
       if (!ev) return sendJson(res, 404, { error: 'no event' });
+      if (!hasViewAccess(req, ev)) return sendJson(res, 401, { needViewPass: true, eventName: ev.name });
       return sendJson(res, 200, publicState(ev));
+    }
+    if (p === '/api/view/login' && req.method === 'POST') {
+      const b = await readBody(req);
+      const ev = getEvent(b.eventId);
+      if (!ev) return sendJson(res, 404, { error: 'no event' });
+      if (!ev.viewPassHash) return sendJson(res, 200, { ok: true });
+      if (!checkPw(String(b.password || ''), ev.viewPassHash)) return sendJson(res, 401, { error: 'パスワードが違います' });
+      const t = newToken(); DB.viewSessions.push({ t, evId: ev.id }); saveDB();
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Set-Cookie': 'tt_view=' + t + '; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000' });
+      return res.end(JSON.stringify({ ok: true }));
+    }
+    if (p === '/logo.png') {
+      try {
+        const buf = fs.readFileSync(path.join(__dirname, 'logo.png'));
+        res.writeHead(200, { 'Content-Type': 'image/png', 'Cache-Control': 'public, max-age=86400' });
+        return res.end(buf);
+      } catch (e) { return sendHtml(res, 404, 'no logo'); }
     }
     if (p === '/api/register' && req.method === 'POST') {
       const b = await readBody(req);
       const ev = getEvent(b.eventId);
       if (!ev) return sendJson(res, 404, { error: 'no event' });
-      if (!ev.regOpen || ev.phase !== 'entry') return sendJson(res, 400, { error: '受付は終了しています' });
+      if (!isRegOpen(ev)) return sendJson(res, 400, { error: '受付は終了しています' });
       const teamName = String(b.teamName || '').trim();
       if (!teamName) return sendJson(res, 400, { error: 'チーム名を入力してください' });
       const pairsIn = Array.isArray(b.pairs) ? b.pairs : [];
@@ -396,10 +460,12 @@ const server = http.createServer(async (req, res) => {
         const p1 = String(q.p1 || '').trim(), p2 = String(q.p2 || '').trim();
         if (!p1 && !p2) continue;
         if (!p1 || !p2) return sendJson(res, 400, { error: 'ペアは2人とも入力してください' });
+        const y1 = YEARS.includes(q.year1) ? q.year1 : (YEARS.includes(q.year) ? q.year : '一般');
+        const y2 = YEARS.includes(q.year2) ? q.year2 : (YEARS.includes(q.year) ? q.year : '一般');
         pairs.push({
           pid: uid(), p1, p2,
           category: CATEGORIES.includes(q.category) ? q.category : '混合',
-          year: YEARS.includes(q.year) ? q.year : '一般',
+          year1: y1, year2: y2, year: y1 === y2 ? y1 : y1 + '・' + y2,
           levelAttr: LEVEL_ATTRS.includes(q.levelAttr) ? q.levelAttr : '地区大会未出場',
           startLevel: null,
         });
@@ -409,6 +475,10 @@ const server = http.createServer(async (req, res) => {
       const fee = calcFee(ev, pairs.length, bentoCount);
       const reg = { id: uid(), teamName, contact: String(b.contact || '').trim(), pairs, bentoCount, totalFee: fee.total, createdAt: Date.now() };
       ev.registrations.push(reg);
+      if (ev.phase === 'training') {
+        for (const pr of pairs) placePairInTraining(ev, pr);
+        ensureAssignments(ev);
+      }
       saveDB();
       return sendJson(res, 200, { ok: true, registrationId: reg.id, totalFee: fee.total, feeBreakdown: fee });
     }
@@ -480,6 +550,12 @@ const server = http.createServer(async (req, res) => {
         if (s.allowSameTeam != null) ev.allowSameTeam = !!s.allowSameTeam;
         if (s.allowRematch != null) ev.allowRematch = !!s.allowRematch;
         if (s.regOpen != null) ev.regOpen = !!s.regOpen;
+        if (s.regDeadline != null) ev.regDeadline = String(s.regDeadline || '');
+        if (s.viewPassClear) ev.viewPassHash = null;
+        else if (s.viewPassword) {
+          if (String(s.viewPassword).length < 4) return sendJson(res, 400, { error: '閲覧パスワードは4文字以上にしてください' });
+          ev.viewPassHash = hashPw(String(s.viewPassword));
+        }
         // 申込済みペアの金額を再計算
         for (const r of ev.registrations) r.totalFee = calcFee(ev, r.pairs.length, r.bentoCount).total;
         saveDB();
@@ -495,6 +571,76 @@ const server = http.createServer(async (req, res) => {
         if (!r) return sendJson(res, 404, { error: 'not found' });
         r.bentoCount = Math.max(0, parseInt(b.bentoCount, 10) || 0);
         r.totalFee = calcFee(ev, r.pairs.length, r.bentoCount).total;
+        saveDB();
+        return sendJson(res, 200, { ok: true });
+      }
+      if (p === '/api/admin/pair/add') {
+        if (ev.phase === 'tournament') return sendJson(res, 400, { error: 'トーナメント中はペアを追加できません' });
+        const teamName = String(b.teamName || '').trim();
+        const p1 = String(b.p1 || '').trim(), p2 = String(b.p2 || '').trim();
+        if (!teamName) return sendJson(res, 400, { error: 'チーム名を入力してください' });
+        if (!p1 || !p2) return sendJson(res, 400, { error: '選手は2人とも入力してください' });
+        const y1 = YEARS.includes(b.year1) ? b.year1 : '一般';
+        const y2 = YEARS.includes(b.year2) ? b.year2 : '一般';
+        const pair = {
+          pid: uid(), p1, p2,
+          category: CATEGORIES.includes(b.category) ? b.category : '混合',
+          year1: y1, year2: y2, year: y1 === y2 ? y1 : y1 + '・' + y2,
+          levelAttr: LEVEL_ATTRS.includes(b.levelAttr) ? b.levelAttr : '地区大会未出場',
+          startLevel: (b.startLevel == null || b.startLevel === '') ? null : Math.max(0, parseInt(b.startLevel, 10) || 0),
+        };
+        let reg = ev.registrations.find(r => r.teamName === teamName);
+        if (!reg) { reg = { id: uid(), teamName, contact: String(b.contact || '').trim(), pairs: [], bentoCount: 0, totalFee: 0, createdAt: Date.now() }; ev.registrations.push(reg); }
+        reg.pairs.push(pair);
+        reg.totalFee = calcFee(ev, reg.pairs.length, reg.bentoCount).total;
+        if (ev.phase === 'training') { placePairInTraining(ev, pair); ensureAssignments(ev); }
+        saveDB();
+        return sendJson(res, 200, { ok: true, pid: pair.pid });
+      }
+      if (p === '/api/admin/pair/update') {
+        let owner = null, pair = null;
+        for (const r of ev.registrations) { const f = r.pairs.find(x => x.pid === b.pid); if (f) { owner = r; pair = f; break; } }
+        if (!pair) return sendJson(res, 404, { error: 'pair not found' });
+        const p1 = String(b.p1 || '').trim(), p2 = String(b.p2 || '').trim();
+        if (!p1 || !p2) return sendJson(res, 400, { error: '選手は2人とも入力してください' });
+        pair.p1 = p1; pair.p2 = p2;
+        if (CATEGORIES.includes(b.category)) pair.category = b.category;
+        if (YEARS.includes(b.year1)) pair.year1 = b.year1;
+        if (YEARS.includes(b.year2)) pair.year2 = b.year2;
+        const ys = pairYears(pair); pair.year = ys[0] === ys[1] ? ys[0] : ys[0] + '・' + ys[1];
+        if (LEVEL_ATTRS.includes(b.levelAttr)) pair.levelAttr = b.levelAttr;
+        const newTeam = String(b.teamName || '').trim();
+        if (newTeam && newTeam !== owner.teamName) {
+          owner.pairs = owner.pairs.filter(x => x.pid !== pair.pid);
+          let target = ev.registrations.find(r => r.teamName === newTeam);
+          if (!target) { target = { id: uid(), teamName: newTeam, contact: '', pairs: [], bentoCount: 0, totalFee: 0, createdAt: Date.now() }; ev.registrations.push(target); }
+          target.pairs.push(pair);
+          target.totalFee = calcFee(ev, target.pairs.length, target.bentoCount).total;
+          if (owner.pairs.length === 0) ev.registrations = ev.registrations.filter(r => r.id !== owner.id);
+          else owner.totalFee = calcFee(ev, owner.pairs.length, owner.bentoCount).total;
+        }
+        saveDB();
+        return sendJson(res, 200, { ok: true });
+      }
+      if (p === '/api/admin/pair/delete') {
+        if (ev.phase === 'tournament' && ev.tournament) {
+          const inT = JSON.stringify(ev.tournament.rounds).includes(b.pid);
+          if (inT) return sendJson(res, 400, { error: 'トーナメントに出場中のペアは削除できません' });
+        }
+        let removed = false;
+        for (const r of ev.registrations) {
+          const before = r.pairs.length;
+          r.pairs = r.pairs.filter(x => x.pid !== b.pid);
+          if (r.pairs.length !== before) { removed = true; r.totalFee = calcFee(ev, r.pairs.length, r.bentoCount).total; }
+        }
+        if (!removed) return sendJson(res, 404, { error: 'pair not found' });
+        ev.registrations = ev.registrations.filter(r => r.pairs.length > 0);
+        if (ev.phase === 'training' || ev.phase === 'tournament') {
+          ev.levels = ev.levels.map(l => l.filter(x => x !== b.pid));
+          delete ev.stats[b.pid];
+          ev.matches = ev.matches.filter(m => m.status === 'done' || (m.a !== b.pid && m.b !== b.pid));
+          if (ev.phase === 'training') ensureAssignments(ev);
+        }
         saveDB();
         return sendJson(res, 200, { ok: true });
       }
@@ -593,6 +739,11 @@ const BASE_CSS = `
 body{margin:0;background:var(--bg);color:var(--ink);font-family:-apple-system,"Hiragino Kaku Gothic ProN","Noto Sans JP",sans-serif;font-size:15px}
 header.top{background:var(--acc);color:#fff;padding:10px 14px;display:flex;flex-wrap:wrap;gap:8px;align-items:center}
 header.top h1{font-size:17px;margin:0}
+.brand{display:flex;align-items:center;gap:10px}
+.brand img.logo{width:44px;height:44px;border-radius:50%;background:#fff;object-fit:cover;flex:none}
+.brandsub{font-size:11px;opacity:.92;letter-spacing:.02em}
+footer.foot{text-align:center;color:var(--mut);font-size:12px;padding:14px 10px 22px}
+footer.foot img{width:22px;height:22px;border-radius:50%;vertical-align:-6px;margin-right:5px}
 header.top nav{margin-left:auto;display:flex;gap:6px;flex-wrap:wrap}
 header.top a{color:#fff;text-decoration:none;background:rgba(255,255,255,.18);padding:5px 10px;border-radius:999px;font-size:13px}
 main{max-width:980px;margin:0 auto;padding:12px}
@@ -626,10 +777,10 @@ function pageShell(title, bodyHtml, script) {
   return '<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8">' +
     '<meta name="viewport" content="width=device-width,initial-scale=1">' +
     '<meta name="color-scheme" content="only light"><title>' + esc(title) + '</title><style>' + BASE_CSS + '</style></head><body>' +
-    bodyHtml + (script ? '<script>' + script + '</script>' : '') + '</body></html>';
+    bodyHtml + '<footer class="foot"><img src="/logo.png" alt="">このアプリは岩瀬ジュニア ソフトテニスクラブ（岩瀬STC）が開発・運営しています</footer>' + (script ? '<script>' + script + '</script>' : '') + '</body></html>';
 }
 function topBar(title) {
-  return '<header class="top"><h1>' + esc(title) + '</h1><nav>' +
+  return '<header class="top"><div class="brand"><img class="logo" src="/logo.png" alt="岩瀬ジュニア ソフトテニスクラブ"><div><h1>' + esc(title) + '</h1><div class="brandsub">岩瀬ジュニア・岩瀬STC 開発アプリ</div></div></div><nav>' +
     '<a href="/">対戦表</a><a href="/results">実績</a><a href="/register">参加申込</a><a href="/admin">管理者</a></nav></header>';
 }
 const CLIENT_COMMON = `
@@ -642,11 +793,29 @@ function pairHtml(p,extra){
   return '<div><span class="vs">'+esc(p.label)+'</span> <span class="mut">('+esc(p.teamName)+')</span>'+(extra||'')+
   '<div class="mut">'+esc(p.category)+' / '+esc(p.year)+' / '+esc(p.levelAttr)+' ・ '+p.w+'勝'+p.l+'敗</div></div>';
 }
+function showViewLock(){
+  var el=document.getElementById('viewlock');if(el)el.classList.remove('hidden');
+  var main=document.getElementById('viewmain');if(main)main.classList.add('hidden');
+}
+function bindViewLock(){
+  var b=document.getElementById('viewbtn');if(!b)return;
+  b.onclick=function(){
+    var pw=document.getElementById('viewpw').value;
+    fetch('/api/view/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({eventId:EVENT_ID,password:pw})})
+    .then(function(r){return r.json()}).then(function(j){
+      if(j.ok){document.getElementById('viewlock').classList.add('hidden');var m=document.getElementById('viewmain');if(m)m.classList.remove('hidden');if(window.load)window.load();}
+      else document.getElementById('viewmsg').textContent=j.error||'パスワードが違います';
+    });
+  };
+}
+var VIEWLOCK_HTML='<div id="viewlock" class="card hidden"><h2>🔒 閲覧パスワード</h2><p class="mut">この大会は個人情報保護のため、閲覧にパスワードが必要です。主催者から案内されたパスワードを入力してください。</p><label class="f"><span>パスワード</span><input id="viewpw" type="password" style="width:100%"></label><button id="viewbtn">閲覧する</button><div id="viewmsg" class="mut" style="margin-top:6px"></div></div>';
 `;
 
 function viewerPage() {
   const body = topBar('トレーニングマッチ対戦表') +
     '<main>' +
+    '<div id="viewlockbox"></div>' +
+    '<div id="viewmain">' +
     '<div id="evhead"></div>' +
     '<div id="callout"></div>' +
     '<div class="card"><h2>コート状況</h2><div id="courts" class="grid c2"></div></div>' +
@@ -654,7 +823,7 @@ function viewerPage() {
     '<div id="tournament"></div>' +
     '<div class="card"><h2>最近の結果</h2><div id="recent"></div></div>' +
     '<p class="mut">このページは15秒ごとに自動更新されます。</p>' +
-    '</main>';
+    '</div></main>';
   const script = CLIENT_COMMON + `
 var lastCallKey='';
 function render(S){
@@ -726,7 +895,9 @@ function roundName(total,ri){
   if(fromEnd===2)return '準々決勝';
   return (ri+1)+'回戦';
 }
-function load(){api('/api/state'+(EVENT_ID?'?event='+EVENT_ID:'')).then(render).catch(function(){})}
+function load(){api('/api/state'+(EVENT_ID?'?event='+EVENT_ID:'')).then(function(j){if(j.needViewPass){showViewLock();return}render(j)}).catch(function(){})}
+window.load=load;
+document.getElementById('viewlockbox').innerHTML=VIEWLOCK_HTML;bindViewLock();
 load();setInterval(load,15000);
 `;
   return pageShell('トレーニングマッチ対戦表', body, script);
@@ -755,14 +926,17 @@ function opts(list){return list.map(function(x){return '<option>'+esc(x)+'</opti
 function pairRow(){
   var d=document.createElement('div');
   d.className='match pairrow';
-  d.innerHTML='<div style="display:flex;gap:6px;flex-wrap:wrap">'+
-  '<input class="p1" placeholder="選手1の名前" style="flex:1;min-width:120px">'+
-  '<input class="p2" placeholder="選手2の名前" style="flex:1;min-width:120px"></div>'+
-  '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:6px">'+
-  '<select class="cat">'+opts(CATS)+'</select>'+
-  '<select class="yr">'+opts(YEARS)+'</select>'+
-  '<select class="lv">'+opts(LVS)+'</select>'+
-  '<button type="button" class="sub del">削除</button></div>';
+  d.innerHTML='<div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">'+
+  '<span class="mut" style="min-width:44px">選手1</span><input class="p1" placeholder="名前" style="flex:1;min-width:110px">'+
+  '<select class="yr1" aria-label="選手1の年次">'+opts(YEARS)+'</select></div>'+
+  '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:6px;align-items:center">'+
+  '<span class="mut" style="min-width:44px">選手2</span><input class="p2" placeholder="名前" style="flex:1;min-width:110px">'+
+  '<select class="yr2" aria-label="選手2の年次">'+opts(YEARS)+'</select></div>'+
+  '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:6px;align-items:center">'+
+  '<span class="mut">部門</span><select class="cat">'+opts(CATS)+'</select>'+
+  '<span class="mut">レベル</span><select class="lv">'+opts(LVS)+'</select>'+
+  '<button type="button" class="sub del">削除</button></div>'+
+  '<div class="mut" style="margin-top:4px">年次は選手ごとに選べます（学年違いのペアもそのまま入力してください）</div>';
   d.querySelector('.del').onclick=function(){d.remove();recalc()};
   d.querySelectorAll('input,select').forEach(function(el){el.addEventListener('input',recalc);el.addEventListener('change',recalc)});
   return d;
@@ -783,7 +957,10 @@ function recalc(){
 }
 function setEvent(ev){
   EV=ev;
-  document.getElementById('evinfo').textContent=(ev.date||'')+' '+(ev.phase==='entry'&&ev.regOpen?'受付中':'受付終了');
+  var dl=ev.regDeadline||ev.date||'';
+  document.getElementById('evinfo').textContent='開催日 '+(ev.date||'未定')+(dl?' ／ 受付締切 '+dl:'')+' ／ '+(ev.regOpen?'受付中':'受付終了');
+  document.getElementById('submit').disabled=!ev.regOpen;
+  document.getElementById('submit').textContent=ev.regOpen?'申し込む':'受付は終了しています';
   fetch('/api/fee',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({eventId:ev.id,pairCount:0,bentoCount:0})})
   .then(function(r){return r.json()}).then(function(j){
     var bb=document.getElementById('bentobox');
@@ -796,9 +973,8 @@ function setEvent(ev){
 }
 api('/api/events').then(function(j){
   var sel=document.getElementById('evsel');
-  var open=j.events.filter(function(e){return e.phase==='entry'&&e.regOpen});
-  var list=open.length?open:j.events;
-  if(!list.length){sel.innerHTML='<option>大会がありません</option>';return}
+  var list=j.events.filter(function(e){return e.regOpen});
+  if(!list.length){sel.innerHTML='<option>現在受付中の大会はありません</option>';document.getElementById('evinfo').textContent='現在受付中の大会はありません';document.getElementById('submit').disabled=true;return}
   sel.innerHTML=list.map(function(e){return '<option value="'+e.id+'">'+esc(e.name)+'（'+esc(e.date||'')+'）</option>'}).join('');
   if(EVENT_ID)sel.value=EVENT_ID;
   setEvent(list.find(function(e){return e.id===sel.value})||list[0]);
@@ -813,7 +989,7 @@ document.getElementById('submit').onclick=function(){
     var p1=d.querySelector('.p1').value.trim(),p2=d.querySelector('.p2').value.trim();
     if(!p1&&!p2)return;
     if(!p1||!p2){bad=true;return}
-    pairs.push({p1:p1,p2:p2,category:d.querySelector('.cat').value,year:d.querySelector('.yr').value,levelAttr:d.querySelector('.lv').value});
+    pairs.push({p1:p1,p2:p2,category:d.querySelector('.cat').value,year1:d.querySelector('.yr1').value,year2:d.querySelector('.yr2').value,levelAttr:d.querySelector('.lv').value});
   });
   if(bad){alert('ペアは2人とも名前を入力してください');return}
   if(!pairs.length){alert('ペアを1組以上入力してください');return}
@@ -833,12 +1009,12 @@ document.getElementById('submit').onclick=function(){
 
 function resultsPage() {
   const body = topBar('実績確認') +
-    '<main><div class="card"><h2>ペア別実績</h2>' +
+    '<main><div id="viewlockbox"></div><div id="viewmain"><div class="card"><h2>ペア別実績</h2>' +
     '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px"><input id="q" placeholder="チーム名・選手名で検索" style="flex:1;min-width:160px">' +
     '<select id="teamsel"><option value="">すべてのチーム</option></select></div>' +
     '<div id="standings"></div></div>' +
     '<div class="card"><h2>チーム別集計</h2><div id="byteam"></div></div>' +
-    '<p class="mut">このページは誰でも閲覧できます。15秒ごとに自動更新されます。</p></main>';
+    '<p class="mut">15秒ごとに自動更新されます。大会によっては閲覧パスワードが必要です。</p></div></main>';
   const script = CLIENT_COMMON + `
 var S=null;
 function render(){
@@ -869,6 +1045,7 @@ function render(){
 }
 function load(){
   api('/api/state'+(EVENT_ID?'?event='+EVENT_ID:'')).then(function(j){
+    if(j.needViewPass){showViewLock();return}
     S=j;
     var sel=document.getElementById('teamsel');
     var cur=sel.value;
@@ -880,6 +1057,8 @@ function load(){
 }
 document.getElementById('q').addEventListener('input',render);
 document.getElementById('teamsel').addEventListener('change',render);
+window.load=load;
+document.getElementById('viewlockbox').innerHTML=VIEWLOCK_HTML;bindViewLock();
 load();setInterval(load,15000);
 `;
   return pageShell('実績確認', body, script);
@@ -1024,12 +1203,70 @@ function renderSettings(){
   '<div class="grid c2"><div><label class="f"><span>同チーム同士の対戦</span><select id="s_sameTeam" style="width:100%"><option value="1"'+(s.allowSameTeam!==false?' selected':'')+'>あり（対戦する）</option><option value="0"'+(s.allowSameTeam===false?' selected':'')+'>なし（避ける）</option></select></label></div>'+
   '<div><label class="f"><span>一度対戦したペア同士の再戦</span><select id="s_rematch" style="width:100%"><option value="1"'+(s.allowRematch!==false?' selected':'')+'>あり（再戦する）</option><option value="0"'+(s.allowRematch===false?' selected':'')+'>なし（避ける）</option></select></label></div></div>'+
   '<label class="f"><span>要項の備考</span><textarea id="s_notes" rows="3" style="width:100%">'+esc(s.notes||'')+'</textarea></label>'+
-  '<label style="display:block;margin:6px 0"><input type="checkbox" id="s_regOpen" '+(s.regOpen?'checked':'')+'> 申込受付を開放する</label>';
+  '<label style="display:block;margin:6px 0"><input type="checkbox" id="s_regOpen" '+(s.regOpen?'checked':'')+'> 申込受付を開放する</label>'+
+  '<div class="grid c2"><div>'+fld('受付締切日（空欄なら開催日まで）','s_regDeadline',s.regDeadline||'','date')+'<p class="mut">締切日までは、トレーニング開始後でも申込フォームから追加申込でき、当日追加としてそのまま参加できます。</p></div>'+
+  '<div><label class="f"><span>閲覧用パスワード（大会ごと） '+(s.viewPassHash?'［現在：設定済み］':'［現在：未設定］')+'</span><input id="s_viewpw" type="password" placeholder="変更する場合のみ入力" style="width:100%"></label>'+
+  '<label style="display:block;margin:6px 0"><input type="checkbox" id="s_viewpwClear"> 閲覧パスワードを解除する（誰でも閲覧可に戻す）</label>'+
+  '<p class="mut">設定すると対戦表・実績ページの閲覧にパスワードが必要になります。参加者へパスワードを案内してください。</p></div></div>';
 }
+var EDIT_PID=null;
+function pairFormHtml(){
+  var catOpts=['男子','女子','混合'].map(function(c){return '<option>'+c+'</option>'}).join('');
+  var yrOpts=['小4以下','小5','小6','中1','中2','中3','高1','高2','高3','一般'].map(function(c){return '<option>'+c+'</option>'}).join('');
+  var lvOpts=['県大会出場','地区大会出場','地区大会未出場','初心者'].map(function(c){return '<option>'+c+'</option>'}).join('');
+  var teamList=EV.registrations.map(function(r){return '<option value="'+esc(r.teamName)+'">'}).join('');
+  var startOpts='<option value="">自動（属性）</option>';
+  for(var i=0;i<EV.levelCount;i++)startOpts+='<option value="'+i+'">'+esc(ST.levelNames[i])+'リーグ</option>';
+  return '<div class="match" style="background:var(--acc2)"><b id="ap_title">当日ペア追加・変更</b>'+
+  '<div class="mut">当日来たペアの追加や、名前・年次・チームの変更ができます。トレーニング中でも追加でき、追加したペアはすぐ対戦に入ります。</div>'+
+  '<label class="f"><span>チーム名（既存チームは選べます）</span><input id="ap_team" list="ap_teams" style="width:100%"><datalist id="ap_teams">'+teamList+'</datalist></label>'+
+  '<div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center"><span class="mut" style="min-width:44px">選手1</span><input id="ap_p1" placeholder="名前" style="flex:1;min-width:110px"><select id="ap_y1">'+yrOpts+'</select></div>'+
+  '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:6px;align-items:center"><span class="mut" style="min-width:44px">選手2</span><input id="ap_p2" placeholder="名前" style="flex:1;min-width:110px"><select id="ap_y2">'+yrOpts+'</select></div>'+
+  '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:6px;align-items:center"><span class="mut">部門</span><select id="ap_cat">'+catOpts+'</select><span class="mut">レベル</span><select id="ap_lv">'+lvOpts+'</select>'+
+  (EV.phase!=='tournament'?'<span class="mut">開始レベル</span><select id="ap_start">'+startOpts+'</select>':'')+
+  '</div><div style="margin-top:8px;display:flex;gap:6px;flex-wrap:wrap"><button id="ap_btn" onclick="savePairForm()">＋ ペアを追加</button><button class="sub" onclick="clearPairForm()">入力をクリア</button></div></div>';
+}
+window.clearPairForm=function(){
+  EDIT_PID=null;
+  ['ap_team','ap_p1','ap_p2'].forEach(function(id){document.getElementById(id).value=''});
+  document.getElementById('ap_title').textContent='当日ペア追加・変更';
+  document.getElementById('ap_btn').textContent='＋ ペアを追加';
+};
+window.editPair=function(pid){
+  var found=null,team='';
+  EV.registrations.forEach(function(r){r.pairs.forEach(function(p){if(p.pid===pid){found=p;team=r.teamName}})});
+  if(!found)return;
+  EDIT_PID=pid;
+  document.getElementById('ap_team').value=team;
+  document.getElementById('ap_p1').value=found.p1;document.getElementById('ap_p2').value=found.p2;
+  document.getElementById('ap_y1').value=found.year1||found.year||'一般';
+  document.getElementById('ap_y2').value=found.year2||found.year||'一般';
+  document.getElementById('ap_cat').value=found.category;document.getElementById('ap_lv').value=found.levelAttr;
+  document.getElementById('ap_title').textContent='ペアを変更中：'+found.p1+'・'+found.p2;
+  document.getElementById('ap_btn').textContent='変更を保存';
+  document.getElementById('ap_team').scrollIntoView({behavior:'smooth',block:'center'});
+};
+window.savePairForm=function(){
+  var body={eventId:EV.id,teamName:document.getElementById('ap_team').value,p1:document.getElementById('ap_p1').value,p2:document.getElementById('ap_p2').value,
+    year1:document.getElementById('ap_y1').value,year2:document.getElementById('ap_y2').value,
+    category:document.getElementById('ap_cat').value,levelAttr:document.getElementById('ap_lv').value};
+  var st=document.getElementById('ap_start');if(st)body.startLevel=st.value===''?null:parseInt(st.value,10);
+  if(EDIT_PID){body.pid=EDIT_PID;post('/api/admin/pair/update',body).then(function(j){if(!j.ok){alert(j.error||'失敗');return}clearPairForm();load()});}
+  else post('/api/admin/pair/add',body).then(function(j){if(!j.ok){alert(j.error||'失敗');return}clearPairForm();load()});
+};
+window.delPair=function(pid,label){
+  if(!confirm(label+' を削除しますか？\\nトレーニング中の場合、対戦相手の待機・試合中マッチも取り消されます。'))return;
+  post('/api/admin/pair/delete',{eventId:EV.id,pid:pid}).then(function(j){if(!j.ok)alert(j.error||'失敗');load()});
+};
 function renderRegs(){
+  var ae=document.activeElement;
+  if(EDIT_PID)return;
+  if(ae&&ae.id&&ae.id.indexOf('ap_')===0)return;
+  var p1El=document.getElementById('ap_p1');
+  if(p1El&&(p1El.value||document.getElementById('ap_p2').value||document.getElementById('ap_team').value))return;
   var totalPairs=0,totalFee=0,totalBento=0;
   EV.registrations.forEach(function(r){totalPairs+=r.pairs.length;totalFee+=r.totalFee;totalBento+=r.bentoCount});
-  document.getElementById('regsummary').innerHTML='<p><b>'+EV.registrations.length+'チーム / '+totalPairs+'ペア / 合計 '+totalFee.toLocaleString()+'円'+(EV.bentoCheck?' / 弁当 '+totalBento+'個':'')+'</b></p>';
+  document.getElementById('regsummary').innerHTML='<p><b>'+EV.registrations.length+'チーム / '+totalPairs+'ペア / 合計 '+totalFee.toLocaleString()+'円'+(EV.bentoCheck?' / 弁当 '+totalBento+'個':'')+'</b></p>'+pairFormHtml();
   var lvOpts=function(cur){
     var h='<option value="">自動（属性）</option>';
     for(var i=0;i<EV.levelCount;i++)h+='<option value="'+i+'"'+(cur===i?' selected':'')+'>'+esc(ST.levelNames[i])+'リーグ</option>';
@@ -1040,10 +1277,12 @@ function renderRegs(){
     '<a class="btn sub" target="_blank" href="/print/receipt?event='+EV.id+'&reg='+r.id+'">🖨 領収書</a> '+
     '<button class="sub" onclick="delReg(\\''+r.id+'\\')">申込を削除</button>';
     if(EV.bentoCheck)h+='<div style="margin-top:4px">弁当：<input type="number" min="0" value="'+r.bentoCount+'" style="width:80px" onchange="setBento(\\''+r.id+'\\',this.value)"> 個</div>';
-    h+='<table style="margin-top:6px"><tr><th>ペア</th><th>部門</th><th>年次</th><th>レベル</th>'+(EV.phase==='entry'?'<th>開始レベル</th>':'')+'</tr>';
+    h+='<table style="margin-top:6px"><tr><th>ペア</th><th>部門</th><th>年次</th><th>レベル</th>'+(EV.phase==='entry'?'<th>開始レベル</th>':'')+'<th>操作</th></tr>';
     r.pairs.forEach(function(p){
-      h+='<tr><td>'+esc(p.p1)+'・'+esc(p.p2)+'</td><td>'+esc(p.category)+'</td><td>'+esc(p.year)+'</td><td>'+esc(p.levelAttr)+'</td>';
+      var yl=(p.year1&&p.year2&&p.year1!==p.year2)?p.year1+'・'+p.year2:(p.year||p.year1||'');
+      h+='<tr><td>'+esc(p.p1)+' <span class="mut">('+( esc(p.year1||p.year||''))+')</span>・'+esc(p.p2)+' <span class="mut">('+( esc(p.year2||p.year||''))+')</span></td><td>'+esc(p.category)+'</td><td>'+esc(yl)+'</td><td>'+esc(p.levelAttr)+'</td>';
       if(EV.phase==='entry')h+='<td><select onchange="setStartLevel(\\''+p.pid+'\\',this.value)">'+lvOpts(p.startLevel)+'</select></td>';
+      h+='<td style="white-space:nowrap"><button class="sub" onclick="editPair(\\''+p.pid+'\\')">変更</button> <button class="sub" onclick="delPair(\\''+p.pid+'\\',\\''+esc(p.p1)+'・'+esc(p.p2)+'\\')">削除</button></td>';
       h+='</tr>';
     });
     return h+'</table></div>';
@@ -1116,8 +1355,9 @@ document.getElementById('savesettings').onclick=function(){
     levelCount:parseInt(g('s_levelCount').value,10),courtCount:parseInt(g('s_courtCount').value,10),gameMode:g('s_gameMode').value,
     advanceCount:parseInt(g('s_advanceCount').value,10),feeType:g('s_feeType').value,feeAmount:parseInt(g('s_feeAmount').value,10),
     bentoCheck:g('s_bentoCheck').value==='1',bentoPrice:parseInt(g('s_bentoPrice').value,10),regOpen:g('s_regOpen').checked,
+    regDeadline:g('s_regDeadline').value,viewPassword:g('s_viewpw').value,viewPassClear:g('s_viewpwClear').checked,
     allowSameTeam:g('s_sameTeam').value==='1',allowRematch:g('s_rematch').value==='1'
-  }}).then(function(j){document.getElementById('setmsg').textContent=j.ok?'保存しました':'保存に失敗しました';load()});
+  }}).then(function(j){document.getElementById('setmsg').textContent=j.ok?'保存しました':(j.error||'保存に失敗しました');load()});
 };
 document.getElementById('newev').onclick=function(){
   var name=prompt('新しい大会名');
@@ -1165,7 +1405,7 @@ init();
 function printShell(title, inner) {
   return '<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8"><meta name="color-scheme" content="only light"><title>' + esc(title) + '</title><style>' +
     'body{font-family:"Hiragino Kaku Gothic ProN","Noto Sans JP",sans-serif;color:#111;margin:24px}h1{font-size:20px}table{border-collapse:collapse;width:100%;font-size:13px}th,td{border:1px solid #999;padding:5px 7px;text-align:left}th{background:#eee}.noprint{margin-bottom:14px}@media print{.noprint{display:none}}' +
-    '</style></head><body><div class="noprint"><button onclick="window.print()">🖨 印刷する</button> <a href="/admin">管理者ページに戻る</a></div>' + inner + '</body></html>';
+    '</style></head><body><div class="noprint"><button onclick="window.print()">🖨 印刷する</button> <a href="/admin">管理者ページに戻る</a></div>' + inner + '<p style="color:#666;font-size:11px;margin-top:18px"><img src="/logo.png" alt="" style="width:20px;height:20px;border-radius:50%;vertical-align:-5px"> 岩瀬ジュニア ソフトテニスクラブ（岩瀬STC）開発アプリ</p></body></html>';
 }
 function rosterPrintPage(ev) {
   let totalPairs = 0, totalFee = 0, totalBento = 0;
@@ -1175,7 +1415,7 @@ function rosterPrintPage(ev) {
     r.pairs.forEach((p, pi) => {
       rows += '<tr>' +
         (pi === 0 ? '<td rowspan="' + r.pairs.length + '">' + (ri + 1) + '</td><td rowspan="' + r.pairs.length + '">' + esc(r.teamName) + '</td>' : '') +
-        '<td>' + esc(p.p1) + '</td><td>' + esc(p.p2) + '</td><td>' + esc(p.category) + '</td><td>' + esc(p.year) + '</td><td>' + esc(p.levelAttr) + '</td>' +
+        '<td>' + esc(p.p1) + '</td><td>' + esc(p.p2) + '</td><td>' + esc(p.category) + '</td><td>' + esc(pairYearLabel(p)) + '</td><td>' + esc(p.levelAttr) + '</td>' +
         (pi === 0 ? '<td rowspan="' + r.pairs.length + '">' + (ev.bentoCheck ? r.bentoCount + '個' : '-') + '</td><td rowspan="' + r.pairs.length + '">' + r.totalFee.toLocaleString() + '円</td>' : '') +
         '</tr>';
     });
@@ -1209,6 +1449,7 @@ function outlinePrintPage(ev) {
     '<table>' +
     '<tr><th style="width:140px">開催日</th><td>' + esc(ev.date || '') + '</td></tr>' +
     '<tr><th>会場</th><td>' + esc(ev.venue || '') + '</td></tr>' +
+    '<tr><th>受付締切</th><td>' + esc(regDeadlineOf(ev) || '当日まで') + '</td></tr>' +
     '<tr><th>主催</th><td>' + esc(ev.organizer || '') + '</td></tr>' +
     '<tr><th>参加費</th><td>' + unitLabel + ' ' + ev.feeAmount.toLocaleString() + '円' + (ev.bentoCheck ? '（弁当 1個 ' + ev.bentoPrice.toLocaleString() + '円、申込時に注文可）' : '') + '</td></tr>' +
     '<tr><th>試合形式</th><td>トレーニングマッチ（レベル別リーグ：' + levels + ' の' + ev.levelCount + '段階）<br>勝てば1つ上のレベルへ、負ければ1つ下のレベルへ移動します（最上位・最下位は残留）。<br>' + gm + ' ／ コート ' + ev.courtCount + '面</td></tr>' +
