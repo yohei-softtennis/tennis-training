@@ -1078,7 +1078,7 @@ function adminPage() {
     '<div class="card"><h2>大会</h2><div style="display:flex;gap:6px;flex-wrap:wrap"><select id="evsel" style="flex:1;min-width:200px"></select>' +
     '<button class="sub" id="newev">＋ 新しい大会</button><button class="danger" id="delev">この大会を削除</button></div></div>' +
     '<div id="callout"></div>' +
-    '<div class="card"><h2>コート状況と結果入力</h2><div style="margin-bottom:8px"><button id="soundbtn" class="sub">🔊 音声アナウンス：ON</button> <span class="mut">待機ペアが出たら音声とバナーでお知らせします</span></div><div id="courts" class="grid c2"></div></div>' +
+    '<div class="card"><h2>コート状況と結果入力</h2><div style="margin-bottom:8px"><button id="soundbtn" class="sub">🔊 音声アナウンス：ON</button> <button id="soundtest" class="sub">▶ テスト再生</button> <span class="mut">待機ペアが出たらチャイム＋音声とバナーでお知らせします</span><div id="soundstat" class="mut" style="margin-top:4px"></div></div><div id="courts" class="grid c2"></div></div>' +
     '<div class="card"><h2>大会設定</h2><div id="settings"></div><button id="savesettings">設定を保存</button> <span id="setmsg" class="mut"></span></div>' +
     '<div class="card"><h2>申込一覧・当日資料</h2><div id="regsummary"></div><div id="regs"></div>' +
     '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px"><a class="btn sub" id="printroster" target="_blank">🖨 名簿を印刷</a><a class="btn sub" id="printoutline" target="_blank">🖨 要項を印刷</a></div></div>' +
@@ -1090,26 +1090,87 @@ var EV=null, ST=null, seenWait={}, firstLoad=true;
 var soundOn=(function(){try{var v=localStorage.getItem('tt_sound');return v===null?true:v==='1'}catch(e){return true}})();
 function post(path,body){return fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})}).then(function(r){return r.json()})}
 var utters=[];
-function speak(text){
-  if(!soundOn)return;
+var armed=false, audioCtx=null, speakQueue=[], speakPlaying=false, pendingCalls=[], curAudio=null;
+function soundStat(msg){var el=document.getElementById('soundstat');if(el)el.textContent=msg}
+function speakNative(text,done){
   try{
-    if(!window.speechSynthesis)return;
+    if(!window.speechSynthesis){done&&done();return}
     var u=new SpeechSynthesisUtterance(text);
     u.lang='ja-JP';u.rate=0.95;
     var vs=speechSynthesis.getVoices().filter(function(v){return v.lang&&v.lang.indexOf('ja')===0});
     if(vs.length)u.voice=vs[0];
+    u.onend=function(){done&&done()};
+    u.onerror=function(){done&&done()};
     utters.push(u);if(utters.length>10)utters.shift();
     speechSynthesis.resume();
     speechSynthesis.speak(u);
+    setTimeout(function(){done&&done()},Math.max(4000,text.length*350));
+  }catch(e){done&&done()}
+}
+function playNextSpeak(){
+  if(!speakQueue.length){speakPlaying=false;return}
+  speakPlaying=true;
+  var text=speakQueue.shift();
+  var finished=false;
+  var finish=function(){if(finished)return;finished=true;setTimeout(playNextSpeak,350)};
+  try{
+    var url='https://translate.google.com/translate_tts?ie=UTF-8&client=tw-ob&tl=ja&q='+encodeURIComponent(text);
+    var a=new Audio(url);
+    curAudio=a;
+    a.onended=finish;
+    a.onerror=function(){soundStat('音声：端末の音声で再生します');speakNative(text,finish)};
+    var pr=a.play();
+    if(pr&&pr.catch)pr.catch(function(){soundStat('音声：端末の音声で再生します');speakNative(text,finish)});
+    else soundStat('音声：読み上げ中…');
+    setTimeout(function(){if(!finished&&a.paused===false)soundStat('音声：ネット音声で再生中')},600);
+    setTimeout(finish,30000);
+  }catch(e){speakNative(text,finish)}
+}
+function speak(text){
+  if(!soundOn)return;
+  speakQueue.push(text);
+  if(!speakPlaying)playNextSpeak();
+}
+function chime(){
+  if(!soundOn)return;
+  try{
+    if(!audioCtx){var AC=window.AudioContext||window.webkitAudioContext;if(AC)audioCtx=new AC()}
+    if(!audioCtx)return;
+    if(audioCtx.state==='suspended')audioCtx.resume();
+    var t0=audioCtx.currentTime;
+    [880,1318].forEach(function(f,i){
+      var o=audioCtx.createOscillator(),g=audioCtx.createGain();
+      o.type='sine';o.frequency.value=f;
+      g.gain.setValueAtTime(0.0001,t0+i*0.22);
+      g.gain.exponentialRampToValueAtTime(0.25,t0+i*0.22+0.03);
+      g.gain.exponentialRampToValueAtTime(0.0001,t0+i*0.22+0.2);
+      o.connect(g);g.connect(audioCtx.destination);
+      o.start(t0+i*0.22);o.stop(t0+i*0.22+0.22);
+    });
   }catch(e){}
 }
+function announceCalls(list){
+  if(!list.length)return;
+  chime();
+  list.forEach(function(x){
+    speak(x.m.a.teamName+'の'+x.m.a.label+'ペアと、'+x.m.b.teamName+'の'+x.m.b.label+'ペアは、'+x.court+'番コートで待機してください');
+  });
+}
 if(window.speechSynthesis){try{speechSynthesis.getVoices();speechSynthesis.onvoiceschanged=function(){speechSynthesis.getVoices()}}catch(e){}}
-/* 音声ロック解除: ページを開いた後の最初のタップで無音の発話をして許可を取り、以後は定期的に resume して停止を防ぐ */
+/* 音声ロック解除: 最初のタップで音声再生の許可を取り、その時点で待機中のペアがいればまとめて読み上げる */
 document.addEventListener('pointerdown',function prime(){
-  try{if(window.speechSynthesis){speechSynthesis.resume();var u=new SpeechSynthesisUtterance(' ');u.volume=0;u.lang='ja-JP';speechSynthesis.speak(u)}}catch(e){}
+  armed=true;
+  try{
+    var AC=window.AudioContext||window.webkitAudioContext;
+    if(AC){if(!audioCtx)audioCtx=new AC();if(audioCtx.state==='suspended')audioCtx.resume()}
+    var silent=new Audio('data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YQAAAAA=');
+    var pr=silent.play();if(pr&&pr.catch)pr.catch(function(){});
+    if(window.speechSynthesis)speechSynthesis.resume();
+  }catch(e){}
   document.removeEventListener('pointerdown',prime);
+  if(pendingCalls.length){var pc=pendingCalls;pendingCalls=[];announceCalls(pc)}
 });
-setInterval(function(){try{if(soundOn&&window.speechSynthesis)speechSynthesis.resume()}catch(e){}},10000);
+setInterval(function(){try{if(soundOn&&window.speechSynthesis)speechSynthesis.resume();if(audioCtx&&audioCtx.state==='suspended'&&armed)audioCtx.resume()}catch(e){}},10000);
 document.addEventListener('visibilitychange',function(){try{if(!document.hidden&&window.speechSynthesis)speechSynthesis.resume()}catch(e){}});
 function loadEvents(){
   return api('/api/events').then(function(j){
@@ -1145,12 +1206,12 @@ function announceCheck(){
       return '<div class="callout">📣 '+x.court+'番コート待機：'+esc(x.m.a.label)+'（'+esc(x.m.a.teamName)+'） vs '+esc(x.m.b.label)+'（'+esc(x.m.b.teamName)+'）</div>';
     }).join('');
   } else co.innerHTML='';
-  if(!firstLoad&&newOnes.length){
-    newOnes.forEach(function(x,i){
-      setTimeout(function(){
-        speak(x.m.a.teamName+'の'+x.m.a.label+'ペアと、'+x.m.b.teamName+'の'+x.m.b.label+'ペアは、'+x.court+'番コートで待機してください');
-      },i*6000);
-    });
+  if(newOnes.length){
+    if(armed){announceCalls(newOnes)}
+    else{
+      newOnes.forEach(function(x){if(!pendingCalls.some(function(y){return y.m.id===x.m.id}))pendingCalls.push(x)});
+      soundStat('音声：画面を一度タップすると読み上げが始まります');
+    }
   }
   firstLoad=false;
 }
@@ -1346,7 +1407,14 @@ document.getElementById('soundbtn').onclick=function(){
   soundOn=!soundOn;
   try{localStorage.setItem('tt_sound',soundOn?'1':'0')}catch(e){}
   this.textContent=soundOn?'🔊 音声アナウンス：ON':'🔊 音声アナウンス：OFF';
-  if(soundOn)speak('音声アナウンスをオンにしました');
+  if(soundOn){armed=true;speak('音声アナウンスをオンにしました')}
+};
+document.getElementById('soundtest').onclick=function(){
+  if(!soundOn){soundOn=true;try{localStorage.setItem('tt_sound','1')}catch(e){}document.getElementById('soundbtn').textContent='🔊 音声アナウンス：ON'}
+  armed=true;
+  soundStat('音声：テスト再生中…');
+  chime();
+  setTimeout(function(){speak('テストです。音声アナウンスが流れています。聞こえたら準備OKです')},500);
 };
 document.getElementById('savesettings').onclick=function(){
   var g=function(id){return document.getElementById(id)};
