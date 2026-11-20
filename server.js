@@ -1289,24 +1289,61 @@ function chime(){
   try{
     ensureCtx();
     if(!audioCtx)return;
-    var t0=audioCtx.currentTime;
-    [880,1318].forEach(function(f,i){
-      var o=audioCtx.createOscillator(),g=audioCtx.createGain();
-      o.type='sine';o.frequency.value=f;
-      g.gain.setValueAtTime(0.0001,t0+i*0.22);
-      g.gain.exponentialRampToValueAtTime(0.25,t0+i*0.22+0.03);
-      g.gain.exponentialRampToValueAtTime(0.0001,t0+i*0.22+0.2);
-      o.connect(g);g.connect(audioCtx.destination);
-      o.start(t0+i*0.22);o.stop(t0+i*0.22+0.22);
+    var t0=audioCtx.currentTime+0.03;
+    // 目立つアラート音: ピンポーン（高→低）を2回、倍音つきで大きく鳴らす
+    var seq=[[1318,0],[1046,0.26],[1318,0.68],[1046,0.94]];
+    seq.forEach(function(pair){
+      var f=pair[0],off=pair[1];
+      [[1,'sine',0.34],[2,'triangle',0.10]].forEach(function(h){
+        var o=audioCtx.createOscillator(),g=audioCtx.createGain();
+        o.type=h[1];o.frequency.value=f*h[0];
+        g.gain.setValueAtTime(0.0001,t0+off);
+        g.gain.exponentialRampToValueAtTime(h[2],t0+off+0.02);
+        g.gain.exponentialRampToValueAtTime(0.0001,t0+off+0.36);
+        o.connect(g);g.connect(audioCtx.destination);
+        o.start(t0+off);o.stop(t0+off+0.38);
+      });
     });
   }catch(e){}
 }
+var CHIME_MS=1350, ANN_GAP_MS=900;
+function chimeAsync(){
+  return new Promise(function(resolve){
+    chime();
+    setTimeout(resolve,CHIME_MS);
+  });
+}
+function playOneSpeak(text){
+  return playTTSWebAudio(text).then(function(d1){
+    if(d1)return true;
+    soundStat('音声：別の方式で再生します');
+    return playTTSAudioEl(text).then(function(d2){
+      if(d2)return true;
+      soundStat('音声：端末の音声で再生します');
+      return new Promise(function(res){speakNative(text,function(){res(true)})});
+    });
+  });
+}
+var annQueue=[], annPlaying=false;
+function runAnnQueue(){
+  if(annPlaying)return;
+  var item=annQueue.shift();
+  if(!item)return;
+  annPlaying=true;
+  var steps=Promise.resolve();
+  if(item.chime)steps=steps.then(chimeAsync);
+  steps.then(function(){return playOneSpeak(item.text)}).then(function(){
+    setTimeout(function(){annPlaying=false;runAnnQueue()},ANN_GAP_MS);
+  },function(){
+    setTimeout(function(){annPlaying=false;runAnnQueue()},ANN_GAP_MS);
+  });
+}
 function announceCalls(list){
   if(!list.length)return;
-  chime();
-  list.forEach(function(x){
-    speak(x.m.a.teamName+'の'+x.m.a.label+'ペアと、'+x.m.b.teamName+'の'+x.m.b.label+'ペアは、'+x.court+'番コートで待機してください');
+  list.forEach(function(x,i){
+    annQueue.push({chime:i===0,text:x.m.a.teamName+'の'+x.m.a.label+'ペアと、'+x.m.b.teamName+'の'+x.m.b.label+'ペアは、'+x.court+'番コートで待機してください'});
   });
+  runAnnQueue();
 }
 if(window.speechSynthesis){try{speechSynthesis.getVoices();speechSynthesis.onvoiceschanged=function(){speechSynthesis.getVoices()}}catch(e){}}
 /* 音声ロック解除: 最初のタップで音声再生の許可を取り、その時点で待機中のペアがいればまとめて読み上げる */
@@ -1591,8 +1628,8 @@ document.getElementById('soundtest').onclick=function(){
   if(!soundOn){soundOn=true;try{localStorage.setItem('tt_sound','1')}catch(e){}document.getElementById('soundbtn').textContent='🔊 音声アナウンス：ON'}
   armed=true;
   soundStat('音声：テスト再生中…');
-  chime();
-  setTimeout(function(){speak('テストです。音声アナウンスが流れています。聞こえたら準備OKです')},500);
+  annQueue.push({chime:true,text:'テストです。音声アナウンスが流れています。聞こえたら準備OKです'});
+  runAnnQueue();
 };
 document.getElementById('savesettings').onclick=function(){
   var g=function(id){return document.getElementById(id)};
