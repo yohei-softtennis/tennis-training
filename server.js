@@ -1422,6 +1422,16 @@ function announceCheck(){
   }
   firstLoad=false;
 }
+function recallMatch(mid){
+  var found=null,fcourt=0;
+  ST.courts.forEach(function(c){c.waiting.forEach(function(m){if(m.id===mid){found=m;fcourt=c.court}})});
+  if(!found)return;
+  if(!soundOn){soundOn=true;try{localStorage.setItem('tt_sound','1')}catch(e){}var sb=document.getElementById('soundbtn');if(sb)sb.textContent='🔊 音声アナウンス：ON'}
+  armed=true;
+  annQueue.push({chime:true,text:found.a.teamName+'の'+found.a.label+'ペアと、'+found.b.teamName+'の'+found.b.label+'ペアは、'+fcourt+'番コートで待機してください'});
+  runAnnQueue();
+  soundStat('音声：もう一度呼び出しています');
+}
 function matchAdminHtml(m,court,status){
   var h='<div class="match '+(status==='playing'?'playing':'waiting')+'"><span class="badge">'+(status==='playing'?'試合中':'待機')+'</span> <span class="badge lv">'+esc(ST.levelNames[m.level])+'リーグ</span>';
   h+=pairHtml(m.a)+'<div class="mut" style="text-align:center">vs</div>'+pairHtml(m.b);
@@ -1430,6 +1440,9 @@ function matchAdminHtml(m,court,status){
     '<input type="number" min="0" id="sc-'+m.id+'-a" style="width:64px" placeholder="'+esc(m.a?m.a.label:'')+'">'+
     '<span>―</span><input type="number" min="0" id="sc-'+m.id+'-b" style="width:64px" placeholder="'+esc(m.b?m.b.label:'')+'">'+
     '<button onclick="confirmScore(\\''+m.id+'\\')">確定</button></div>';
+  }
+  if(status==='waiting'){
+    h+='<div style="margin-top:6px"><button class="sub" onclick="recallMatch(\\''+m.id+'\\')">📣 もう一度呼び出す</button></div>';
   }
   return h+'</div>';
 }
