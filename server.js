@@ -109,6 +109,7 @@ function blankEvent() {
     notes: '',           // 要項の備考
     levelCount: 4,       // レベル数 (A,B,C,D...)
     courtCount: 4,
+    waitSlots: 1,  // 1コートあたりの待機試合数 (1-3)
     gameMode: 'single',  // single|double|triple = 1コート同時試合数
     feeType: 'pair',     // person|pair|team
     feeAmount: 2000,
@@ -214,6 +215,7 @@ function lastPlayedAt(ev, pid) {
    1コートあたり: 試合中 = gameMode試合まで + 待機 = 1試合。
    対戦は同一レベル内で、試合数が少なく長く待っているペアを優先。 */
 function matchesPerCourt(ev) { return ev.gameMode === 'triple' ? 3 : ev.gameMode === 'double' ? 2 : 1; }
+function waitSlotsOf(ev) { const n = parseInt(ev.waitSlots, 10); return (n >= 1 && n <= 3) ? n : 1; }
 function ensureAssignments(ev) {
   if (ev.phase !== 'training') return;
   const per = matchesPerCourt(ev);
@@ -240,8 +242,9 @@ function ensureAssignments(ev) {
     for (;;) {
       const playing = ev.matches.filter(m => m.court === court && m.status === 'playing').length;
       const waiting = ev.matches.filter(m => m.court === court && m.status === 'waiting').length;
-      if (playing >= per && waiting >= 1) break;
-      if (playing + waiting >= per + 1) break;
+      const ws = waitSlotsOf(ev);
+      if (playing >= per && waiting >= ws) break;
+      if (playing + waiting >= per + ws) break;
       const m = pickMatch(ev);
       if (!m) break;
       m.court = court;
@@ -634,6 +637,7 @@ const server = http.createServer(async (req, res) => {
           }
         }
         if (s.courtCount != null) ev.courtCount = Math.max(1, Math.min(30, parseInt(s.courtCount, 10) || 4));
+        if (s.waitSlots != null) ev.waitSlots = Math.max(1, Math.min(3, parseInt(s.waitSlots, 10) || 1));
         if (['single', 'double', 'triple'].includes(s.gameMode)) ev.gameMode = s.gameMode;
         if (['person', 'pair', 'team'].includes(s.feeType)) ev.feeType = s.feeType;
         if (s.feeAmount != null) ev.feeAmount = Math.max(0, parseInt(s.feeAmount, 10) || 0);
@@ -1429,6 +1433,7 @@ function renderSettings(){
   '<div><label class="f"><span>レベル数（A〜）</span><input id="s_levelCount" type="number" min="1" max="12" value="'+s.levelCount+'" style="width:100%"></label>'+
   '<label class="f"><span>コート数</span><input id="s_courtCount" type="number" min="1" max="30" value="'+s.courtCount+'" style="width:100%"></label>'+
   '<label class="f"><span>ゲーム形式</span><select id="s_gameMode" style="width:100%">'+gm('single','シングルゲーム（1コート1試合）')+gm('double','ダブルゲーム（1コート2試合同時）')+gm('triple','トリプルゲーム（1コート3試合同時）')+'</select></label>'+
+  '<label class="f"><span>待機数（1コートあたり）</span><select id="s_waitSlots" style="width:100%"><option value="1"'+((s.waitSlots||1)===1?' selected':'')+'>1試合</option><option value="2"'+(s.waitSlots===2?' selected':'')+'>2試合</option><option value="3"'+(s.waitSlots===3?' selected':'')+'>3試合</option></select></label>'+
   '<label class="f"><span>トーナメント進出ペア数</span><input id="s_advanceCount" type="number" min="2" value="'+s.advanceCount+'" style="width:100%"></label></div></div>'+
   '<div class="grid c2"><div><label class="f"><span>参加費の単位</span><select id="s_feeType" style="width:100%">'+ft('person','人数単位（1人あたり）')+ft('pair','ペア単位（1ペアあたり）')+ft('team','チーム単位（1チームあたり）')+'</select></label>'+
   fld('参加費（円）','s_feeAmount',s.feeAmount,'number')+'</div>'+
@@ -1593,7 +1598,7 @@ document.getElementById('savesettings').onclick=function(){
   var g=function(id){return document.getElementById(id)};
   post('/api/admin/settings',{eventId:EV.id,settings:{
     name:g('s_name').value,date:g('s_date').value,venue:g('s_venue').value,organizer:g('s_organizer').value,notes:g('s_notes').value,
-    levelCount:parseInt(g('s_levelCount').value,10),courtCount:parseInt(g('s_courtCount').value,10),gameMode:g('s_gameMode').value,
+    levelCount:parseInt(g('s_levelCount').value,10),courtCount:parseInt(g('s_courtCount').value,10),gameMode:g('s_gameMode').value,waitSlots:parseInt(g('s_waitSlots').value,10),
     advanceCount:parseInt(g('s_advanceCount').value,10),feeType:g('s_feeType').value,feeAmount:parseInt(g('s_feeAmount').value,10),
     bentoCheck:g('s_bentoCheck').value==='1',bentoPrice:parseInt(g('s_bentoPrice').value,10),regOpen:g('s_regOpen').checked,
     regDeadline:g('s_regDeadline').value,viewPassword:g('s_viewpw').value,viewPassClear:g('s_viewpwClear').checked,
