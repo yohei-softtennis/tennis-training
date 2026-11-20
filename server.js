@@ -265,21 +265,26 @@ function pickMatch(ev) {
     else activeByLevel[m.level] = (activeByLevel[m.level] || 0) + 1;
   }
   let best = null;
-  for (let lv = 0; lv < ev.levels.length; lv++) {
-    const free = (Array.isArray(ev.levels[lv]) ? ev.levels[lv] : []).filter(pid => !activeMatchOf(ev, pid));
-    if (free.length < 2) continue;
-    const la = activeByLevel[lv] || 0;
-    for (let i = 0; i < free.length; i++) {
-      for (let j = i + 1; j < free.length; j++) {
-        const a = free[i], b = free[j];
-        if (ev.allowSameTeam === false && pm[a] && pm[b] && pm[a].teamId === pm[b].teamId) continue;
-        if (ev.allowRematch === false && played.has([a, b].sort().join('|'))) continue;
-        const score = gamesPlayed(ev, a) + gamesPlayed(ev, b);
-        const wait = Math.min(lastPlayedAt(ev, a), lastPlayedAt(ev, b));
-        if (!best || la < best.la || (la === best.la && (score < best.score || (score === best.score && wait < best.wait)))) best = { a, b, level: lv, la, score, wait };
+  const scan = (ignoreRules) => {
+    for (let lv = 0; lv < ev.levels.length; lv++) {
+      const free = (Array.isArray(ev.levels[lv]) ? ev.levels[lv] : []).filter(pid => !activeMatchOf(ev, pid));
+      if (free.length < 2) continue;
+      const la = activeByLevel[lv] || 0;
+      for (let i = 0; i < free.length; i++) {
+        for (let j = i + 1; j < free.length; j++) {
+          const a = free[i], b = free[j];
+          if (!ignoreRules && ev.allowSameTeam === false && pm[a] && pm[b] && pm[a].teamId === pm[b].teamId) continue;
+          if (!ignoreRules && ev.allowRematch === false && played.has([a, b].sort().join('|'))) continue;
+          const score = gamesPlayed(ev, a) + gamesPlayed(ev, b);
+          const wait = Math.min(lastPlayedAt(ev, a), lastPlayedAt(ev, b));
+          if (!best || la < best.la || (la === best.la && (score < best.score || (score === best.score && wait < best.wait)))) best = { a, b, level: lv, la, score, wait };
+        }
       }
     }
-  }
+  };
+  scan(false);
+  // コートを空けないため、制限内では組めない場合に限り同チーム・再戦でも組む
+  if (!best) scan(true);
   if (!best) return null;
   ev.matchSeq += 1;
   return { id: 'm' + ev.matchSeq, level: best.level, court: 0, a: best.a, b: best.b, status: 'playing', winner: null, createdAt: Date.now(), calledAt: null, finishedAt: null };
@@ -552,8 +557,14 @@ const server = http.createServer(async (req, res) => {
       const reg = { id: uid(), teamName, contact: String(b.contact || '').trim(), pairs, bentoCount, totalFee: fee.total, createdAt: Date.now() };
       ev.registrations.push(reg);
       if (ev.phase === 'training') {
-        for (const pr of pairs) placePairInTraining(ev, pr);
-        ensureAssignments(ev);
+        try {
+          for (const pr of pairs) placePairInTraining(ev, pr);
+          ensureAssignments(ev);
+        } catch (e) {
+          ev.registrations = ev.registrations.filter(r => r.id !== reg.id);
+          for (const pr of pairs) ev.levels = ev.levels.map(l => (Array.isArray(l) ? l.filter(x => x !== pr.pid) : l));
+          throw e;
+        }
       }
       saveDB();
       return sendJson(res, 200, { ok: true, registrationId: reg.id, totalFee: fee.total, feeBreakdown: fee });
@@ -675,7 +686,14 @@ const server = http.createServer(async (req, res) => {
         if (!reg) { reg = { id: uid(), teamName, contact: String(b.contact || '').trim(), pairs: [], bentoCount: 0, totalFee: 0, createdAt: Date.now() }; ev.registrations.push(reg); }
         reg.pairs.push(pair);
         reg.totalFee = calcFee(ev, reg.pairs.length, reg.bentoCount).total;
-        if (ev.phase === 'training') { placePairInTraining(ev, pair); ensureAssignments(ev); }
+        if (ev.phase === 'training') {
+          try { placePairInTraining(ev, pair); ensureAssignments(ev); }
+          catch (e) {
+            reg.pairs = reg.pairs.filter(x => x.pid !== pair.pid);
+            reg.totalFee = calcFee(ev, reg.pairs.length, reg.bentoCount).total;
+            throw e;
+          }
+        }
         saveDB();
         return sendJson(res, 200, { ok: true, pid: pair.pid });
       }
