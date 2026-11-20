@@ -908,6 +908,56 @@ function pairHtml(p,extra){
   return '<div><span class="vs">'+esc(p.label)+'</span> <span class="mut">('+esc(p.teamName)+')</span>'+(extra||'')+
   '<div class="mut">'+esc(p.category)+' / '+esc(p.year)+' / '+esc(p.levelAttr)+' ・ '+p.w+'勝'+p.l+'敗</div></div>';
 }
+function slotHtml(p,m,r,i,side,total){
+  if(!p){
+    if(r>0)return '<span class="mut">'+esc(roundName(total,r-1))+(2*i+side+1)+'の勝者</span>';
+    return '<span class="mut">不戦勝</span>';
+  }
+  var score=side===0?m.ga:m.gb;
+  var win=m.winner&&m.winner===p.pid;
+  return '<span style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis">'+(win?'🏆 ':'')+'<span class="vs"'+(win?' style="color:#2e7d32"':'')+'>'+esc(p.label)+'</span> <span class="mut">('+esc(p.teamName)+')</span></span>'+(score!=null?'<b>'+score+'</b>':'');
+}
+function bracketHtml(T,admin){
+  var BW=236,GAPX=56,HEAD=32,BH=admin?126:90,UNIT=admin?142:106;
+  var rounds=T.rounds,total=rounds.length,centers=[],r,i;
+  for(r=0;r<total;r++){
+    centers.push([]);
+    for(i=0;i<rounds[r].length;i++){
+      centers[r].push(r===0?HEAD+i*UNIT+BH/2:(centers[r-1][2*i]+centers[r-1][2*i+1])/2);
+    }
+  }
+  var W=total*(BW+GAPX)-GAPX+6,H=HEAD+rounds[0].length*UNIT+12;
+  var paths='';
+  for(r=0;r<total-1;r++){
+    for(i=0;i<rounds[r].length;i++){
+      var mm=rounds[r][i];
+      var x1=r*(BW+GAPX)+BW,x2=(r+1)*(BW+GAPX),mx=x1+GAPX/2;
+      var y1=centers[r][i],y2=centers[r+1][Math.floor(i/2)];
+      paths+='<path d="M'+x1+' '+y1+' H'+mx+' V'+y2+' H'+x2+'" stroke="'+(mm.winner?'#2e7d32':'#c0bba9')+'" stroke-width="'+(mm.winner?3:1.6)+'" fill="none"/>';
+    }
+  }
+  var s='<div style="overflow-x:auto"><div style="position:relative;width:'+W+'px;height:'+H+'px">';
+  s+='<svg style="position:absolute;left:0;top:0" width="'+W+'" height="'+H+'">'+paths+'</svg>';
+  for(r=0;r<total;r++){
+    s+='<div style="position:absolute;left:'+(r*(BW+GAPX))+'px;top:2px;width:'+BW+'px;font-weight:700">'+esc(roundName(total,r))+'</div>';
+    rounds[r].forEach(function(m,i){
+      s+='<div class="match" style="position:absolute;margin:0;box-sizing:border-box;overflow:hidden;left:'+(r*(BW+GAPX))+'px;top:'+(centers[r][i]-BH/2)+'px;width:'+BW+'px;height:'+BH+'px">';
+      s+='<span class="badge" style="position:absolute;top:4px;right:6px">'+(i+1)+'</span>';
+      s+='<div style="display:flex;justify-content:space-between;gap:6px;padding-right:22px">'+slotHtml(m.a,m,r,i,0,total)+'</div>';
+      s+='<div style="border-top:1px dashed var(--line);margin:4px 0"></div>';
+      s+='<div style="display:flex;justify-content:space-between;gap:6px;padding-right:22px">'+slotHtml(m.b,m,r,i,1,total)+'</div>';
+      if(admin&&m.a&&m.b&&!m.winner){
+        s+='<div style="display:flex;gap:6px;margin-top:6px;align-items:center"><span class="mut">ゲーム数</span><input type="number" min="0" id="ts-'+r+'-'+i+'-a" style="width:56px"><span>―</span><input type="number" min="0" id="ts-'+r+'-'+i+'-b" style="width:56px"><button onclick="confirmT('+r+','+i+')">確定</button></div>';
+      }
+      if(m.winner){
+        var wp=m.winner===(m.a&&m.a.pid)?m.a:m.b;
+        s+='<div style="margin-top:4px">🏆 <b>'+esc(wp?wp.label:'')+'</b>'+(m.ga!=null?'（'+m.ga+'-'+m.gb+'）':'')+'</div>';
+      }
+      s+='</div>';
+    });
+  }
+  return s+'</div></div>';
+}
 function showViewLock(){
   var el=document.getElementById('viewlock');if(el)el.classList.remove('hidden');
   var main=document.getElementById('viewmain');if(main)main.classList.add('hidden');
@@ -979,18 +1029,7 @@ function render(S){
   // トーナメント
   var t=document.getElementById('tournament');
   if(S.tournament){
-    var h='<div class="card"><h2>トーナメント表</h2><div style="display:flex;gap:14px;overflow-x:auto">';
-    var names=['1回戦','2回戦','準々決勝','準決勝','決勝'];
-    S.tournament.rounds.forEach(function(rd,ri){
-      h+='<div style="min-width:210px"><h3>'+esc(roundName(S.tournament.rounds.length,ri))+'</h3>';
-      rd.forEach(function(m,i){
-        h+='<div class="match"><span class="badge">'+(i+1)+'</span>'+pairHtml(m.a)+'<div class="mut" style="text-align:center">vs</div>'+pairHtml(m.b);
-        if(m.winner){var w=m.winner===(m.a&&m.a.pid)?m.a:m.b;h+='<div>🏆 <b>'+esc(w?labelOf(S,m.winner):'')+'</b>'+(m.ga!=null?'（'+m.ga+'-'+m.gb+'）':'')+'</div>'}
-        h+='</div>';
-      });
-      h+='</div>';
-    });
-    t.innerHTML=h+'</div></div>';
+    t.innerHTML='<div class="card"><h2>トーナメント表</h2>'+bracketHtml(S.tournament,false)+'</div>';
   } else t.innerHTML='';
   // 最近の結果
   document.getElementById('recent').innerHTML=S.recent.length?S.recent.map(function(m){
@@ -1621,20 +1660,7 @@ window.backTraining=function(){post('/api/admin/back-to-training',{eventId:EV.id
 function renderTournament(){
   var t=document.getElementById('tournament');
   if(!ST.tournament){t.innerHTML='<p class="mut">まだトーナメントは始まっていません。実績は<a href="/results">実績ページ</a>で確認できます。</p>';return}
-  var h='<div style="display:flex;gap:14px;overflow-x:auto">';
-  ST.tournament.rounds.forEach(function(rd,ri){
-    h+='<div style="min-width:220px"><h3>'+roundName(ST.tournament.rounds.length,ri)+'</h3>';
-    rd.forEach(function(m,i){
-      h+='<div class="match"><span class="badge">'+(i+1)+'</span>'+pairHtml(m.a)+'<div class="mut" style="text-align:center">vs</div>'+pairHtml(m.b);
-      if(m.a&&m.b&&!m.winner){
-        h+='<div style="display:flex;gap:6px;margin-top:6px;align-items:center;flex-wrap:wrap"><span class="mut">ゲーム数</span><input type="number" min="0" id="ts-'+ri+'-'+i+'-a" style="width:60px"><span>―</span><input type="number" min="0" id="ts-'+ri+'-'+i+'-b" style="width:60px"><button onclick="confirmT('+ri+','+i+')">確定</button></div>';
-      }
-      if(m.winner){var w=m.winner===(m.a&&m.a.pid)?m.a:m.b;h+='<div>🏆 <b>'+esc(w?w.label:'')+'</b>'+(m.ga!=null?'（'+m.ga+'-'+m.gb+'）':'')+'</div>'}
-      h+='</div>';
-    });
-    h+='</div>';
-  });
-  t.innerHTML=h+'</div>';
+  t.innerHTML=bracketHtml(ST.tournament,true);
 }
 window.confirmT=function(r,i){
   var ea=document.getElementById('ts-'+r+'-'+i+'-a'),eb=document.getElementById('ts-'+r+'-'+i+'-b');
