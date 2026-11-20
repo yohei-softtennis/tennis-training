@@ -221,34 +221,6 @@ function ensureAssignments(ev) {
   const per = matchesPerCourt(ev);
   let changed = false;
   const playingCount = c => ev.matches.filter(m => m.court === c && m.status === 'playing').length;
-  // ゲーム形式の同時試合数が減った場合、はみ出した試合中マッチを待機に戻す（新しい順）
-  for (let court = 1; court <= ev.courtCount; court++) {
-    let pc = playingCount(court);
-    if (pc > per) {
-      const excess = ev.matches.filter(m => m.court === court && m.status === 'playing')
-        .sort((x, y) => (y.createdAt || 0) - (x.createdAt || 0));
-      for (const m of excess) {
-        if (pc <= per) break;
-        m.status = 'waiting';
-        m.calledAt = Date.now();
-        pc--; changed = true;
-      }
-    }
-  }
-  // コート数が減って範囲外になったコートのマッチは、待機に回して待機の少ないコートへ寄せる
-  for (const m of ev.matches) {
-    if (m.court > ev.courtCount && (m.status === 'playing' || m.status === 'waiting')) {
-      m.status = 'waiting';
-      if (m.calledAt == null) m.calledAt = m.createdAt || Date.now();
-      let target = 1, min = Infinity;
-      for (let c = 1; c <= ev.courtCount; c++) {
-        const w = ev.matches.filter(x => x.court === c && x.status === 'waiting').length;
-        if (w < min) { min = w; target = c; }
-      }
-      m.court = target;
-      changed = true;
-    }
-  }
   // まず空いているコートへ、他のコートで待機しているマッチを移動して開始する。
   // 待機マッチをコートに固定したままだと、空きコートがあっても特定レベルが滞留するため。
   for (let court = 1; court <= ev.courtCount; court++) {
