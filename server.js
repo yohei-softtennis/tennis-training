@@ -1220,7 +1220,7 @@ function speakNative(text,done){
     utters.push(u);if(utters.length>10)utters.shift();
     speechSynthesis.resume();
     speechSynthesis.speak(u);
-    setTimeout(function(){done&&done()},Math.max(4000,text.length*350));
+    setTimeout(function(){try{speechSynthesis.cancel()}catch(e){}done&&done()},Math.max(4000,text.length*350));
   }catch(e){done&&done()}
 }
 function ensureCtx(){
@@ -1234,7 +1234,11 @@ function playTTSWebAudio(text){
   return new Promise(function(resolve){
     var ctx=ensureCtx();
     if(!ctx){resolve(false);return}
-    var settled=false;var ok=function(v){if(settled)return;settled=true;resolve(v)};
+    var settled=false,started=false;
+    var ok=function(v){if(settled)return;settled=true;resolve(v)};
+    // 読み込みが10秒以内に始まらなければ失敗扱い。再生が始まった後は絶対に失敗扱いにしない
+    // （途中で別方式に切り替えると、同じ文が二重に流れて重なるため）
+    setTimeout(function(){if(!started)ok(false)},10000);
     fetch('/api/tts?q='+encodeURIComponent(text)).then(function(r){
       if(!r.ok)throw new Error('tts '+r.status);
       return r.arrayBuffer();
@@ -1244,11 +1248,11 @@ function playTTSWebAudio(text){
       var src=ctx.createBufferSource();
       src.buffer=buf;src.connect(ctx.destination);
       src.onended=function(){ok(true)};
+      started=true;
       src.start();
       soundStat('音声：読み上げ中（チャイムと同じ仕組みで再生）');
-      setTimeout(function(){ok(true)},buf.duration*1000+5000);
-    }).catch(function(){ok(false)});
-    setTimeout(function(){ok(false)},8000);
+      setTimeout(function(){ok(true)},buf.duration*1000+4000);
+    }).catch(function(){if(!started)ok(false)});
   });
 }
 function playTTSAudioEl(text){
@@ -1261,7 +1265,7 @@ function playTTSAudioEl(text){
       a.onerror=function(){ok(false)};
       var pr=a.play();
       if(pr&&pr.catch)pr.catch(function(){ok(false)});
-      setTimeout(function(){ok(!a.paused)},30000);
+      setTimeout(function(){try{a.pause()}catch(e){}ok(true)},45000);
     }catch(e){ok(false)}
   });
 }
@@ -1290,8 +1294,8 @@ function chime(){
     ensureCtx();
     if(!audioCtx)return;
     var t0=audioCtx.currentTime+0.03;
-    // 目立つアラート音: ピンポーン（高→低）を2回、倍音つきで大きく鳴らす
-    var seq=[[1318,0],[1046,0.26],[1318,0.68],[1046,0.94]];
+    // 目立つアラート音: ピンポーン（高→低）を3回、倍音つきで大きく鳴らす
+    var seq=[[1318,0],[1046,0.24],[1318,0.58],[1046,0.82],[1318,1.16],[1046,1.40]];
     seq.forEach(function(pair){
       var f=pair[0],off=pair[1];
       [[1,'sine',0.34],[2,'triangle',0.10]].forEach(function(h){
@@ -1306,7 +1310,7 @@ function chime(){
     });
   }catch(e){}
 }
-var CHIME_MS=1350, ANN_GAP_MS=900;
+var CHIME_MS=1950, ANN_GAP_MS=1200;
 function chimeAsync(){
   return new Promise(function(resolve){
     chime();
