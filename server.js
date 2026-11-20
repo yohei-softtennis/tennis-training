@@ -1212,7 +1212,7 @@ function speakNative(text,done){
   try{
     if(!window.speechSynthesis){done&&done();return}
     var u=new SpeechSynthesisUtterance(text);
-    u.lang='ja-JP';u.rate=0.95;
+    u.lang='ja-JP';u.rate=0.95;u.volume=1;
     var vs=speechSynthesis.getVoices().filter(function(v){return v.lang&&v.lang.indexOf('ja')===0});
     if(vs.length)u.voice=vs[0];
     u.onend=function(){done&&done()};
@@ -1230,6 +1230,19 @@ function ensureCtx(){
   }catch(e){}
   return audioCtx;
 }
+var masterOut=null;
+function outNode(){
+  var ctx=ensureCtx();
+  if(!ctx)return null;
+  if(!masterOut){
+    try{
+      masterOut=ctx.createDynamicsCompressor();
+      masterOut.threshold.value=-14;masterOut.knee.value=20;masterOut.ratio.value=12;masterOut.attack.value=0.003;masterOut.release.value=0.25;
+      masterOut.connect(ctx.destination);
+    }catch(e){return ctx.destination}
+  }
+  return masterOut;
+}
 function playTTSWebAudio(text){
   return new Promise(function(resolve){
     var ctx=ensureCtx();
@@ -1246,7 +1259,9 @@ function playTTSWebAudio(text){
       return ctx.decodeAudioData(ab);
     }).then(function(buf){
       var src=ctx.createBufferSource();
-      src.buffer=buf;src.connect(ctx.destination);
+      src.buffer=buf;
+      var gn=ctx.createGain();gn.gain.value=1.8;
+      src.connect(gn);gn.connect(outNode()||ctx.destination);
       src.onended=function(){ok(true)};
       started=true;
       src.start();
@@ -1298,13 +1313,13 @@ function chime(){
     var seq=[[1318,0],[1046,0.24],[1318,0.58],[1046,0.82],[1318,1.16],[1046,1.40]];
     seq.forEach(function(pair){
       var f=pair[0],off=pair[1];
-      [[1,'sine',0.34],[2,'triangle',0.10]].forEach(function(h){
+      [[1,'sine',0.85],[2,'triangle',0.22]].forEach(function(h){
         var o=audioCtx.createOscillator(),g=audioCtx.createGain();
         o.type=h[1];o.frequency.value=f*h[0];
         g.gain.setValueAtTime(0.0001,t0+off);
         g.gain.exponentialRampToValueAtTime(h[2],t0+off+0.02);
         g.gain.exponentialRampToValueAtTime(0.0001,t0+off+0.36);
-        o.connect(g);g.connect(audioCtx.destination);
+        o.connect(g);g.connect(outNode()||audioCtx.destination);
         o.start(t0+off);o.stop(t0+off+0.38);
       });
     });
